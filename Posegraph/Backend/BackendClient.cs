@@ -58,11 +58,12 @@ public sealed class BackendClient(Func<int> port) : IDisposable
             throw new InvalidOperationException(Loc.T("当前后端不支持并行识别，请更新并重启后端"));
     }
 
-    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, CancellationToken ct = default)
+    /// <summary>hold：批次内先保留模型，所有批次结束后再按释放策略卸载。</summary>
+    public async Task<SessionInfo> CreateSessionAsync(byte[] image, string name, bool hold = false, CancellationToken ct = default)
     {
         using var content = new ByteArrayContent(image);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}"), content, ct);
+        using var resp = await _http.PostAsync(Url($"/sessions?name={Uri.EscapeDataString(name)}{(hold ? "&hold=true" : "")}"), content, ct);
         return (await ReadAsync<SessionInfo>(resp, ct))!;
     }
 
@@ -92,17 +93,24 @@ public sealed class BackendClient(Func<int> port) : IDisposable
     }
 
     public async Task<RetargetResult> RetargetAsync(string sid, int person, RetargetParams p, string? reference, string? race,
-                                                    bool trustReference = false)
+                                                    bool trustReference = false, bool useAux = true)
     {
         using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/retarget"),
-            new { person, @params = p, reference, race, overlay = true, stick = true, trust_reference = trustReference }, Json);
+            new { person, @params = p, reference, race, overlay = true, stick = true, trust_reference = trustReference, use_aux = useAux }, Json);
         return (await ReadAsync<RetargetResult>(resp))!;
     }
 
-    public async Task<CameraResult> CameraAsync(string sid, int person, RetargetParams p, int? actor, string? race)
+    public async Task<CameraResult> CameraAsync(string sid, int person, RetargetParams p, int? actor, string? race, bool useAux = true)
     {
-        using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/camera"), new { person, @params = p, actor, race }, Json);
+        using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/camera"), new { person, @params = p, actor, race, use_aux = useAux }, Json);
         return (await ReadAsync<CameraResult>(resp))!;
+    }
+
+    /// <summary>给会话挂上辅助视角（各辅助图的会话，取第 0 人）；空数组为去掉。</summary>
+    public async Task<AuxView[]> SetViewsAsync(string sid, IEnumerable<string> aux)
+    {
+        using var resp = await _http.PostAsJsonAsync(Url($"/sessions/{sid}/views"), new { aux = aux.ToArray() }, Json);
+        return (await ReadAsync<ViewsResult>(resp))!.Views;
     }
 
     private async Task PostAsync(string path, object? body)

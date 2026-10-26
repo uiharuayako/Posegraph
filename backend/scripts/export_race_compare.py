@@ -93,7 +93,7 @@ def main() -> None:
     out = {"source": args.npz.name, "races": []}
     for race in races:
         rt = retarget(z["joint_global_rots"], z["joint_coords"], z["rest_joint_coords"], z["rest_joint_rots"], race=race,
-                      vertices_cam=z["vertices"], photo=(float(z["focal_length"]), z["cam_t"], size), neck_scale=args.neck,
+                      vertices_cam=z.get("vertices"), photo=(float(z["focal_length"]), z["cam_t"], size), neck_scale=args.neck,
                       rest_vertices=z.get("rest_vertices"))
         sk = load_ffxiv_skeleton(race)
         G_bind, P_bind = forward_kinematics(sk)

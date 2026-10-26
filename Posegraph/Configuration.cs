@@ -75,9 +75,16 @@ public class Configuration : IPluginConfiguration
     public string LibraryFolder { get; set; } = "";
     public float LibraryThumbSize { get; set; } = 120;
 
+    /// <summary>看过更新日志的插件版本：与当前版本不同时，第一次打开主窗口弹出更新日志。</summary>
+    public string LastChangelog { get; set; } = "";
+
+    // ---- 拆分模式（角色列表）
+    /// <summary>角色列表贴在主窗口右边跟着移动。</summary>
+    public bool SplitDock { get; set; } = true;
+
     /// <summary>新图默认使用的预设：photo / illustration。</summary>
     public string DefaultPreset { get; set; } = "photo";
 
-    /// <summary>每个预设上次调整过的值（不含手动偏移，偏移只对当前图有意义）。</summary>
+    /// <summary>0.3.4～0.3.10 按预设自动保存的调整值。已不再使用：新图片一律用默认值，每张图的值随「保存修正」存进这张图（留着字段免得旧配置读不进来）。</summary>
     public Dictionary<string, RetargetParams> SavedParams { get; set; } = new();
 }

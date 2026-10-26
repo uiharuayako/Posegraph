@@ -21,12 +21,13 @@ namespace Posegraph.UI;
 /// </summary>
 public sealed partial class MainWindow : Window, IDisposable
 {
-    private static readonly Vector4 Green = new(0.35f, 0.85f, 0.4f, 1);
-    private static readonly Vector4 Yellow = new(1f, 0.8f, 0.25f, 1);
-    private static readonly Vector4 Red = new(1f, 0.35f, 0.3f, 1);
-    private static readonly Vector4 Grey = new(0.6f, 0.6f, 0.6f, 1);
+    private static readonly Vector4 Green = PosegraphTheme.Green;
+    private static readonly Vector4 Yellow = PosegraphTheme.Yellow;
+    private static readonly Vector4 Red = PosegraphTheme.Red;
+    private static readonly Vector4 Grey = PosegraphTheme.Grey;
     private static readonly Vector4 Orange = new(1f, 0.55f, 0f, 1);
     private static readonly Vector4 MhrGreen = new(0.31f, 0.86f, 0.31f, 1);
+    private static readonly Vector4 Blue = PosegraphTheme.Blue;
 
 
     // 静态表里的界面文字存中文原文，使用时再 Loc.T 翻译（运行时可切换语言）
@@ -56,6 +57,9 @@ public sealed partial class MainWindow : Window, IDisposable
 
     /// <summary>打开 / 关闭图库窗口（由 Plugin 接上）。</summary>
     public Action? ToggleLibrary { get; set; }
+
+    /// <summary>辅助视角菜单（由 Plugin 接上，与图库右键共用）。</summary>
+    public AuxViewsMenu? AuxMenu { get; set; }
     private readonly SystemProbe _probe = new();
     private readonly BackendUpdater _updater = new();
 
@@ -76,16 +80,16 @@ public sealed partial class MainWindow : Window, IDisposable
     private SessionInfo? _session;
     private string? _imagePath;
     private string? _imageSha1;      // 当前图的内容哈希：会话丢了（后端重启）时据此从识别缓存恢复
-    private bool _correctionLoaded;  // 当前参数来自这张图保存的修正（不写回预设）
+    private string? _savedFix;       // 这张图保存的修正（FullSnapshot），没有为 null：判断有没有未保存的修改
     private IDalamudTextureWrap? _texture;
     private IDalamudTextureWrap? _newTexture;
     private int _person;
     private RetargetParams _params;
-    private bool _paramsDirty;       // 参数可能变了：松手后与已保存的比较，不同就写入配置
-    private string _savedParams = "";
     private string _preset;
     private volatile RetargetResult? _result;
     private volatile bool _recognizing;
+    private (string Path, AuxView View)[] _auxViews = [];   // 当前图挂的辅助视角（已融合进会话）
+    private bool _useAux = true;                             // 3D 页开关：关掉时只用主图，方便对比
 
     // 重定向请求合并：忙时只记"还需要再算一次"
     private volatile bool _rtBusy, _rtDirty, _rtPush;
@@ -137,11 +141,11 @@ public sealed partial class MainWindow : Window, IDisposable
         _server = server;
         _client = new BackendClient(() => _config.BackendPort);
         Library = new ImageLibrary(pi.GetPluginConfigDirectory());
-        Recognition = new RecognitionService(Library, _client, () => _config.BatchRecognitionParallelism);
+        Recognition = new RecognitionService(Library, _client, () => _config.BatchRecognitionParallelism, () => _config.ReleaseAfter == 0);
+        Library.AuxChanged += OnAuxChanged;
         _process = new BackendProcess();
         _preset = config.DefaultPreset;
         _params = LoadParams(_preset);
-        _savedParams = ParamsSnapshot(_params);
 
         Size = new Vector2(420, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -155,6 +159,10 @@ public sealed partial class MainWindow : Window, IDisposable
             });
     }
 
+    public override void PreDraw() => PosegraphTheme.Push();
+
+    public override void PostDraw() => PosegraphTheme.Pop();
+
     public void OpenSettings()
     {
         IsOpen = true;
@@ -166,6 +174,7 @@ public sealed partial class MainWindow : Window, IDisposable
         if (_config.StopBackendOnExit)
             _process.Stop();
         _process.Dispose();
+        Library.AuxChanged -= OnAuxChanged;
         Recognition.Dispose();
         Library.Save();
         _ = Recognition.Completion.ContinueWith(t => { _ = t.Exception; _client.Dispose(); }, TaskScheduler.Default);
@@ -557,6 +566,7 @@ public sealed partial class MainWindow : Window, IDisposable
         {
             try
             {
+                await using var batch = Recognition.Batch();   // 主图和辅助视角只加载一次模型
                 var old = _session;
                 var (info, sha1) = await Recognition.OpenAsync(path, force);
                 var png = await _client.SessionImageAsync(info.SessionId);
@@ -570,13 +580,16 @@ public sealed partial class MainWindow : Window, IDisposable
                 var fix = Library.ReadCorrection(sha1);
                 if (fix is not null) _preset = fix.Preset;
                 _params = fix?.Params.Clone() ?? LoadParams(_preset);
-                _correctionLoaded = fix is not null;
+                _savedFix = fix is null ? null : FullSnapshot(fix.Preset, fix.Params);
                 _selected = null;
+                _useAux = true;
+                _auxViews = [];
                 if (old is not null) _ = _client.DeleteSessionAsync(old.SessionId).ContinueWith(_ => { });
+                var aux = Library.AuxImages(sha1).Length > 0 ? await AttachAuxAsync(info, sha1) : "";
                 SetStatus((info.Device is null
                               ? Loc.T("已从识别缓存读取")
                               : Loc.F("识别完成（{0} {1:0.0} 秒）", DeviceLabel(info.Device), info.InferenceMs / 1000f))
-                          + (fix is not null ? Loc.T("，已恢复保存的修正") : "")
+                          + (fix is not null ? Loc.T("，已恢复保存的修正") : "") + aux
                           + (InLibrary ? "" : Loc.T("；未存入图库（工具栏的文件夹 + 按钮可存入）")) + (note ?? ""), Green);
                 RequestRetarget(_config.PushAfterRecognize);
             }
@@ -591,14 +604,48 @@ public sealed partial class MainWindow : Window, IDisposable
         });
     }
 
-    /// <summary>预设的值：有保存过的用保存的，否则用内置预设。</summary>
-    private RetargetParams LoadParams(string preset)
+    /// <summary>
+    /// 把当前图挂着的辅助视角融合进会话（没识别过的辅助图先识别）。返回附在状态后面的说明：几张、什么角度、有没有问题。
+    /// 辅助图识别失败不影响主图，只在说明里提示。
+    /// </summary>
+    private async Task<string> AttachAuxAsync(SessionInfo info, string sha1)
     {
-        if (!_config.SavedParams.TryGetValue(preset, out var saved)) return RetargetParams.Preset(preset);
-        var p = saved.Clone();
-        p.Offsets.Clear();
-        return p;
+        try
+        {
+            SetStatus(Loc.T("识别并融合辅助视角…"), Yellow);
+            var views = await Recognition.AttachAuxAsync(info.SessionId, sha1);
+            if (_imageSha1 == sha1) _auxViews = views;
+            if (views.Length == 0) return "";
+            var text = Loc.F("，已融合 {0} 张辅助视角（{1}）", views.Length,
+                             string.Join("、", views.Select(v => AuxViewsMenu.ViewLabel(v.View.View))));
+            var warnings = views.Select(v => AuxViewsMenu.Warning(v.View) is { } w ? $"{Path.GetFileNameWithoutExtension(v.Path)}：{w}" : null)
+                                .OfType<string>().ToList();
+            return warnings.Count > 0 ? text + "；" + string.Join("；", warnings) : text;
+        }
+        catch (Exception ex)
+        {
+            return Loc.F("；辅助视角融合失败：{0}", ex.Message);
+        }
     }
+
+    /// <summary>图库里给当前图增删了辅助视角：重新融合并重算。</summary>
+    private void OnAuxChanged(string sha1)
+    {
+        if (sha1 != _imageSha1 || _session is not { } session || _recognizing) return;
+        _ = Run(async () =>
+        {
+            var text = await AttachAuxAsync(session, sha1);
+            if (session != _session) return;
+            SetStatus(_auxViews.Length > 0 ? Loc.T("辅助视角已更新") + text : Loc.T("已去掉辅助视角，只用主图"), Green);
+            RequestRetarget(false);
+        });
+    }
+
+    /// <summary>
+    /// 新图片用的值：插件内置预设。不沿用别的图调过的值——每张图不一样，调好的值（调整页的数值 + 3D 页的偏移）
+    /// 用「保存修正」存进这张图，打开时恢复。
+    /// </summary>
+    private static RetargetParams LoadParams(string preset) => RetargetParams.Preset(preset);
 
     private static string ParamsSnapshot(RetargetParams p)
     {
@@ -607,24 +654,29 @@ public sealed partial class MainWindow : Window, IDisposable
         return System.Text.Json.JsonSerializer.Serialize(c);
     }
 
-    /// <summary>调整过的值按预设保存。拖动滑杆时不写，松手后再写。用的是图片自己保存的修正时不写（那是这张图专用的）。</summary>
-    private void PersistParams()
+    /// <summary>预设 + 全部参数（含偏移），判断有没有未保存的修改。</summary>
+    private static string FullSnapshot(string preset, RetargetParams p) => preset + System.Text.Json.JsonSerializer.Serialize(p);
+
+    /// <summary>当前图有未保存的修改：保存过就和保存的比，没保存过就看是否和默认值不同。</summary>
+    private bool HasUnsavedChanges() => _savedFix is null ? HasUserCorrection() : FullSnapshot(_preset, _params) != _savedFix;
+
+    /// <summary>调整页里与预设默认值不同的项数（幅度各组、手部补偿、站姿、辅助骨）。</summary>
+    private int ChangedTuning()
     {
-        if (!_paramsDirty || ImGui.IsAnyItemActive()) return;
-        _paramsDirty = false;
-        if (_correctionLoaded) return;
-        var snapshot = ParamsSnapshot(_params);
-        if (snapshot == _savedParams) return;
-        var saved = _params.Clone();
-        saved.Offsets.Clear();
-        _config.SavedParams[_preset] = saved;
-        _pi.SavePluginConfig(_config);
-        _savedParams = snapshot;
+        var d = RetargetParams.Preset(_preset);
+        var n = AmplitudeGroups.Count(g => Math.Abs(_params.Amp(g.Key) - d.Amp(g.Key)) > 1e-4f);
+        if (Math.Abs(_params.HandStrength - d.HandStrength) > 1e-4f) n++;
+        if (Math.Abs(_params.HandNear - d.HandNear) > 1e-4f) n++;
+        if (Math.Abs(_params.HandFar - d.HandFar) > 1e-4f) n++;
+        if (_params.Upright != d.Upright) n++;
+        if (Math.Abs(_params.UprightMaxDeg - d.UprightMaxDeg) > 1e-4f) n++;
+        if (_params.Ground != d.Ground) n++;
+        if (Math.Abs(_params.HelperStrength - d.HelperStrength) > 1e-4f) n++;
+        return n;
     }
 
     private void RequestRetarget(bool push)
     {
-        _paramsDirty = true;
         if (_session is null) return;
         _rtPush |= push;
         if (_rtBusy)
@@ -658,7 +710,7 @@ public sealed partial class MainWindow : Window, IDisposable
                 try
                 {
                     result = await _client.RetargetAsync(session.SessionId, _person, _params.Clone(), reference,
-                                                         _raceOverride ?? _detectedRace, trust);
+                                                         _raceOverride ?? _detectedRace, trust, _useAux);
                 }
                 catch (BackendException ex) when (ex.StatusCode == 404 && !restored && _imageSha1 is not null)
                 {
@@ -669,6 +721,7 @@ public sealed partial class MainWindow : Window, IDisposable
                     restored = true;
                     if (await Recognition.RestoreAsync(_imageSha1!, session.Name) is not { } info)
                         throw new InvalidOperationException(Loc.T("会话已失效且没有识别缓存，请重新识别"));
+                    if (_auxViews.Length > 0) await Recognition.AttachAuxAsync(info.SessionId, _imageSha1!);   // 融合结果在会话里，跟着丢了
                     if (session == _session) _session = info;
                     _rtPush |= push;
                     _rtDirty = true;
@@ -774,7 +827,7 @@ public sealed partial class MainWindow : Window, IDisposable
         SetStatus(Loc.T("复刻镜头中（约 10 秒，画面会跳动）…"), Yellow);
         _ = Run(async () =>
         {
-            var r = await _client.CameraAsync(_session.SessionId, _person, _params.Clone(), _actor, _raceOverride ?? _detectedRace);
+            var r = await _client.CameraAsync(_session.SessionId, _person, _params.Clone(), _actor, _raceOverride ?? _detectedRace, _useAux);
             SetStatus(Loc.F("镜头已复刻：机位误差 {0:0.0}cm，构图偏差 {1:0.0}%", r.PositionErrorCm, r.FramingErrorPct), Green);
         });
     }
@@ -815,16 +868,16 @@ public sealed partial class MainWindow : Window, IDisposable
     }
 
     /// <summary>
-    /// 图库里批量存到 Brio 姿势库：用当前的调整参数（不含手动偏移）和种族计算，不读游戏姿势（骨长用标准骨长）。
+    /// 图库里批量存到 Brio 姿势库：用每张图保存的修正（没有就用默认值）和当前种族计算，不读游戏姿势（骨长用标准骨长）。
     /// 没识别过的先识别。返回保存的路径。
     /// </summary>
     public async Task<string> SaveToBrioAsync(string image)
     {
-        var (info, _) = await Recognition.OpenAsync(image);
+        var (info, sha1) = await Recognition.OpenAsync(image);
         try
         {
-            var p = _params.Clone();
-            p.Offsets.Clear();
+            if (Library.AuxCount(sha1) > 0) await Recognition.AttachAuxAsync(info.SessionId, sha1);
+            var p = Library.ReadCorrection(sha1)?.Params.Clone() ?? LoadParams(_preset);
             var r = await _client.RetargetAsync(info.SessionId, 0, p, null, _raceOverride ?? _detectedRace);
             var preview = await TextureImages.ThumbnailPngAsync(_textures, _readback, await File.ReadAllBytesAsync(image), 256);
             return BrioPoseLibrary.Save(r.Pose, Path.GetFileNameWithoutExtension(image), Library.Meta(image)?.Tags ?? [],
@@ -835,6 +888,68 @@ public sealed partial class MainWindow : Window, IDisposable
             await _client.DeleteSessionAsync(info.SessionId);
         }
     }
+
+    // ------------------------------------------------------------------ 拆分模式（角色列表窗口调用）
+
+    public (int Index, string Name)[] Actors => _actors;
+
+    public bool InGpose => _clientState.IsGPosing;
+
+    /// <summary>必须在主线程（绘制时）调用。</summary>
+    public PoseApplier.ActorIdentity? Identify(int index) => _applier.Identify(index);
+
+    /// <summary>在主窗口里编辑某个角色的图：切到这个角色并打开图片（3D / 调整页的修正照常保存到这张图）。</summary>
+    public void Edit(int actor, string image)
+    {
+        SelectActor(actor);
+        OpenImage(image);
+    }
+
+    /// <summary>
+    /// 把一张图直接算好应用到指定角色（不经过主窗口当前的图）：用这张图保存的修正，没有就用当前预设；挂了辅助视角就融合。
+    /// 骨长按这个角色的游戏姿势；像换种族前残留的 Brio 姿势时先清除再算（同单人流程）。返回错误信息，成功为 null。
+    /// </summary>
+    public async Task<string?> ApplyToActorAsync(int actor, string image)
+    {
+        var (info, sha1) = await Recognition.OpenAsync(image);
+        try
+        {
+            if (Library.AuxCount(sha1) > 0) await Recognition.AttachAuxAsync(info.SessionId, sha1);
+            var fix = Library.ReadCorrection(sha1);
+            var p = fix?.Params.Clone() ?? LoadParams(_preset);
+            if (await _applier.IdentifyAsync(actor) is not { } id) return Loc.T("找不到角色");
+            var race = (id.Key == _actorKey ? _raceOverride : _actorStates.GetValueOrDefault(id.Key)?.RaceOverride) ?? id.Race;
+            var trust = _cleanSignatures.Contains(id.Signature);
+            var reference = await _applier.GetPoseAsync(actor);
+            if (reference is not null) _backups.TryAdd(id.Signature, reference);
+            var r = await _client.RetargetAsync(info.SessionId, 0, p, reference, race, trust);
+            if (r.ReferenceStale && !trust && await _applier.ResetPoseAsync(actor))
+            {
+                _cleanSignatures.Add(id.Signature);
+                _backups.Remove(id.Signature);
+                reference = await _applier.GetPoseAsync(actor);
+                r = await _client.RetargetAsync(info.SessionId, 0, p, reference, race, true);
+            }
+            return await _applier.ApplyAsync(actor, r.Pose);
+        }
+        finally
+        {
+            _ = _client.DeleteSessionAsync(info.SessionId).ContinueWith(_ => { });
+        }
+    }
+
+    /// <summary>主窗口当前打开的图（角色列表里「用主窗口当前的图」）。</summary>
+    public string? CurrentImage => _imagePath is { } p && File.Exists(p) ? p : null;
+
+    /// <summary>主窗口的位置和大小（角色列表贴在它右边）。</summary>
+    public Vector2 WindowPos { get; private set; }
+    public Vector2 WindowSize { get; private set; }
+
+    /// <summary>打开更新日志窗口（由 Plugin 接上）。</summary>
+    public Action? ShowChangelog { get; set; }
+
+    /// <summary>打开 / 关闭角色列表（由 Plugin 接上）。</summary>
+    public Action? ToggleSplit { get; set; }
 
     /// <summary>拖到主窗口的图片 / 文件夹：复制进图库当前文件夹，打开第一张，其余加入批量识别。</summary>
     private void OpenDropped(IReadOnlyCollection<string> files, IReadOnlyCollection<string> dirs)
@@ -880,7 +995,7 @@ public sealed partial class MainWindow : Window, IDisposable
             if (correction is not null)
             {
                 Library.WriteCorrection(sha1, correction);
-                _correctionLoaded = true;
+                _savedFix = FullSnapshot(correction.Preset, correction.Params);
             }
             if (_imagePath == image) _imagePath = saved;
             var rel = Path.GetRelativePath(root, saved);
@@ -899,15 +1014,18 @@ public sealed partial class MainWindow : Window, IDisposable
             _texture?.Dispose();
             _texture = tex;
         }
+        WindowPos = ImGui.GetWindowPos();
+        WindowSize = ImGui.GetWindowSize();
         PollHealth();
         RefreshActors();
-        PersistParams();
         DragSource();
 
         DrawStatusBar();
         DrawToolbar();
 
-        var footer = ImGui.GetFrameHeightWithSpacing() + ImGui.GetTextLineHeightWithSpacing();
+        // 底栏：按钮一行 + 状态文字（按宽度换行，最多占四行）
+        var statusH = ImGui.CalcTextSize(_statusText, false, ImGui.GetContentRegionAvail().X).Y;
+        var footer = ImGui.GetFrameHeightWithSpacing() + Math.Min(statusH, ImGui.GetTextLineHeight() * 4) + ImGui.GetStyle().ItemSpacing.Y;
         if (ImGui.BeginTabBar("##tabs"))
         {
             Tab(0, Loc.T("图像"), DrawImageTab, footer);
@@ -946,11 +1064,36 @@ public sealed partial class MainWindow : Window, IDisposable
                                      : Loc.T("存入图库：复制到图库当前文件夹（按内容查重），并带上 3D / 调整页的修正"), canSave))
                 SaveCurrentToLibrary();
         ImGui.SameLine();
+        var auxCount = _imageSha1 is { } sha ? Library.AuxCount(sha) : 0;
+        using (ImRaii.PushColor(ImGuiCol.Text, Blue, auxCount > 0 && _useAux))
+            if (IconButton("##aux", FontAwesomeIcon.Clone,
+                           auxCount > 0 ? Loc.F("辅助视角：{0} 张（同一动作其他角度的图，自动融合补深度）", auxCount)
+                                        : Loc.T("辅助视角：给这张图挂上同一动作其他角度的图（最好是侧面），自动融合补深度"),
+                           _imagePath is not null && File.Exists(_imagePath) && AuxMenu is not null))
+                ImGui.OpenPopup("##auxMenu");
+        if (ImGui.BeginPopup("##auxMenu"))
+        {
+            if (_imagePath is { } path) AuxMenu!.Draw(path, [], (text, color) => SetStatus(text, color));
+            ImGui.EndPopup();
+        }
+        ImGui.SameLine();
+        if (IconButton("##split", FontAwesomeIcon.Users, Loc.T("角色列表（拆分模式）：多个角色各绑一张图，一起应用"), ToggleSplit is not null))
+            ToggleSplit!();
+        ImGui.SameLine();
+        IconButton("##video", FontAwesomeIcon.Film, Loc.T("视频逐帧（预留）"), false);
+        if (_recognizing || _rtBusy)
+        {
+            ImGui.SameLine();
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextColored(Yellow, _recognizing ? Loc.T("识别中…") : Loc.T("计算中…"));
+        }
 
-        // 角色
+        // 第三行：角色、图中人物、种族骨架，按比例分满整行
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        var row = ImGui.GetContentRegionAvail().X - spacing * 2;
         var label = _actor is { } actor ? ActorName(actor) : Loc.T("GPose 目标");
-        ImGui.SetNextItemWidth(ComboWidth(label, 140));
-        if (ImGui.BeginCombo("##actor", label))
+        ImGui.SetNextItemWidth(row * 0.42f);
+        if (ImGui.BeginCombo("##actor", UiText.ComboPreview(label, row * 0.42f)))
         {
             if (ImGui.Selectable(Loc.T("GPose 目标"), _actor is null)) SelectActor(null);
             foreach (var (index, name) in _actors)
@@ -965,8 +1108,8 @@ public sealed partial class MainWindow : Window, IDisposable
         using (ImRaii.Disabled(humans <= 1))
         {
             var personLabel = humans <= 1 ? Loc.T("1 人") : Loc.F("第 {0} 人", _person + 1);
-            ImGui.SetNextItemWidth(ComboWidth(personLabel, 70));
-            if (ImGui.BeginCombo("##person", personLabel))
+            ImGui.SetNextItemWidth(row * 0.2f);
+            if (ImGui.BeginCombo("##person", UiText.ComboPreview(personLabel, row * 0.2f)))
             {
                 for (var i = 0; i < humans; i++)
                     if (ImGui.Selectable(Loc.F("第 {0} 人", i + 1), _person == i))
@@ -980,22 +1123,8 @@ public sealed partial class MainWindow : Window, IDisposable
         if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             ImGui.SetTooltip(Loc.T("图中人物（多人识别预留，目前整图按一个人处理）"));
         ImGui.SameLine();
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X);
         DrawRaceCombo();
-        ImGui.SameLine();
-        IconButton("##video", FontAwesomeIcon.Film, Loc.T("视频逐帧（预留）"), false);
-        if (_recognizing || _rtBusy)
-        {
-            ImGui.SameLine();
-            ImGui.TextColored(Yellow, _recognizing ? Loc.T("识别中…") : Loc.T("计算中…"));
-        }
-    }
-
-    /// <summary>下拉框宽度：放得下当前文字（加箭头和内边距），不小于 min，也不超过剩余宽度。</summary>
-    private static float ComboWidth(string text, float min)
-    {
-        var style = ImGui.GetStyle();
-        var want = ImGui.CalcTextSize(text).X + ImGui.GetFrameHeight() + style.FramePadding.X * 2 + 4;
-        return Math.Min(Math.Max(min * ImGuiHelpers.GlobalScale, want), Math.Max(60, ImGui.GetContentRegionAvail().X));
     }
 
     /// <summary>下一帧刷新角色时按新角色切换状态并重新计算（见 SwitchActor）。</summary>
@@ -1013,8 +1142,7 @@ public sealed partial class MainWindow : Window, IDisposable
             : used is not null ? used.Name : _detectedRace is not null ? Races.Label(_detectedRace) : Loc.T("种族");
         var warn = used is { Warnings.Length: > 0 };
         var raceLabel = warn ? label + " (!)" : label;
-        ImGui.SetNextItemWidth(ComboWidth(raceLabel, 130));
-        if (ImGui.BeginCombo("##race", raceLabel))
+        if (ImGui.BeginCombo("##race", UiText.ComboPreview(raceLabel, ImGui.CalcItemWidth())))
         {
             if (ImGui.Selectable(Loc.F("自动（{0}）", (_detectedRace is null ? Loc.T("按骨长推断") : Races.Label(_detectedRace))), _raceOverride is null))
                 SelectRace(null);
@@ -1082,8 +1210,9 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.T("松开滑杆时自动应用到角色"));
 
-        ImGui.TextColored(_statusColor, _statusText);
-        if (ImGui.IsItemHovered() && _statusText.Length > 30) ImGui.SetTooltip(_statusText);
+        // 状态可能很长（辅助视角说明、错误信息）：按宽度换行，底栏高度跟着变（见 Draw 里的 footer）
+        using (ImRaii.PushColor(ImGuiCol.Text, _statusColor))
+            ImGui.TextWrapped(_statusText);
     }
 
     // ---------------- 图像页
@@ -1105,8 +1234,7 @@ public sealed partial class MainWindow : Window, IDisposable
         var avail = ImGui.GetContentRegionAvail();
         if (_texture is null || _session is null)
         {
-            ImGui.Button(_recognizing ? Loc.T("识别中…") : Loc.T("点左上角图库按钮选图\n或把图片 / 文件夹拖到这里"), new Vector2(avail.X, Math.Max(80, avail.Y)));
-            DropTarget();
+            DrawDropZone(new Vector2(avail.X, Math.Max(80, avail.Y)));
             return;
         }
         var imgW = _session.ImageSize[0];
@@ -1125,6 +1253,58 @@ public sealed partial class MainWindow : Window, IDisposable
         var dl = ImGui.GetWindowDrawList();
         if (showMhr) DrawSegments(dl, ov.Mhr, origin, scale, MhrGreen);
         if (showFf) DrawSegments(dl, ov.Ffxiv, origin, scale, Orange);
+    }
+
+    /// <summary>还没有图时的拖放区：虚线框 + 图标 + 提示，拖着图片悬停时高亮；点一下打开图库。</summary>
+    private void DrawDropZone(Vector2 size)
+    {
+        var pos = ImGui.GetCursorScreenPos();
+        ImGui.InvisibleButton("##dropZone", size);
+        var hovered = ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenBlockedByActiveItem);
+        if (ImGui.IsItemClicked() && !_recognizing) ToggleLibrary?.Invoke();
+        DropTarget();
+
+        var scale = ImGuiHelpers.GlobalScale;
+        var dl = ImGui.GetWindowDrawList();
+        var dragging = _dragDrop.IsDragging;
+        var accent = PosegraphTheme.Accent;
+        var line = ImGui.GetColorU32(dragging || hovered ? accent : accent with { W = 0.35f });
+        dl.AddRectFilled(pos, pos + size, ImGui.GetColorU32(accent with { W = dragging ? 0.10f : hovered ? 0.06f : 0.03f }), 8 * scale);
+        // 虚线边框：沿四条边画短线段
+        var dash = 8 * scale;
+        var inset = 1.5f * scale;
+        var min = pos + new Vector2(inset);
+        var max = pos + size - new Vector2(inset);
+        for (var x = min.X; x < max.X; x += dash * 2)
+        {
+            dl.AddLine(new Vector2(x, min.Y), new Vector2(Math.Min(x + dash, max.X), min.Y), line, 1.5f * scale);
+            dl.AddLine(new Vector2(x, max.Y), new Vector2(Math.Min(x + dash, max.X), max.Y), line, 1.5f * scale);
+        }
+        for (var y = min.Y; y < max.Y; y += dash * 2)
+        {
+            dl.AddLine(new Vector2(min.X, y), new Vector2(min.X, Math.Min(y + dash, max.Y)), line, 1.5f * scale);
+            dl.AddLine(new Vector2(max.X, y), new Vector2(max.X, Math.Min(y + dash, max.Y)), line, 1.5f * scale);
+        }
+
+        var icon = (_recognizing ? FontAwesomeIcon.Spinner : FontAwesomeIcon.Image).ToIconString();
+        var lines = _recognizing
+            ? [Loc.T("识别中…")]
+            : new[] { Loc.T("把图片拖到这里识别"), Loc.T("或点这里打开图库选图") };
+        var lineH = ImGui.GetTextLineHeightWithSpacing();
+        Vector2 iconSize;
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+            iconSize = ImGui.CalcTextSize(icon) * 2;
+        var total = iconSize.Y + 10 * scale + lineH * lines.Length;
+        var y0 = pos.Y + (size.Y - total) / 2;
+        using (ImRaii.PushFont(UiBuilder.IconFont))
+            dl.AddText(UiBuilder.IconFont, ImGui.GetFontSize() * 2, new Vector2(pos.X + (size.X - iconSize.X) / 2, y0), line, icon);
+        y0 += iconSize.Y + 10 * scale;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var w = ImGui.CalcTextSize(lines[i]).X;
+            dl.AddText(new Vector2(pos.X + (size.X - w) / 2, y0 + i * lineH),
+                       ImGui.GetColorU32(i == 0 ? ImGuiCol.Text : ImGuiCol.TextDisabled), lines[i]);
+        }
     }
 
     /// <summary>左侧实线，右侧细线加端点（检查左右是否颠倒），与 preview_overlay.py 一致。</summary>
@@ -1186,22 +1366,37 @@ public sealed partial class MainWindow : Window, IDisposable
     {
         var sha1 = _imageSha1;
         var saved = sha1 is not null && Library.HasCorrection(sha1);
-        if (IconButton("##saveFix", FontAwesomeIcon.Save, Loc.T("保存修正：把当前的关节偏移和调整参数存进这张图的识别缓存，下次打开自动恢复"), sha1 is not null))
+        var unsaved = HasUnsavedChanges();
+        bool save;
+        using (ImRaii.PushColor(ImGuiCol.Text, Yellow, unsaved))
+            save = IconButton("##saveFix", FontAwesomeIcon.Save,
+                              Loc.T("保存修正：把 3D 页的关节偏移和调整页的数值存进这张图，下次打开自动恢复（新图片都从默认值开始）"), sha1 is not null);
+        if (save)
         {
             Library.WriteCorrection(sha1!, new SavedCorrection(_preset, _params.Clone(), DateTime.Now));
-            _correctionLoaded = true;
+            _savedFix = FullSnapshot(_preset, _params);
             SetStatus(Loc.T("已保存这张图的修正"), Green);
         }
         ImGui.SameLine();
         if (IconButton("##clearFix", FontAwesomeIcon.Trash, Loc.T("删除这张图保存的修正（当前调整不变）"), saved))
         {
             Library.DeleteCorrection(sha1!);
-            _correctionLoaded = false;
+            _savedFix = null;
             SetStatus(Loc.T("已删除这张图保存的修正"), Yellow);
         }
         ImGui.SameLine();
         var offsets = _params.Offsets.Count(kv => kv.Value.Any(v => v != 0));
-        ImGui.TextDisabled(saved ? Loc.F("这张图有保存的修正（手动偏移 {0} 处）", offsets) : Loc.F("未保存（手动偏移 {0} 处）", offsets));
+        var detail = Loc.F("（偏移 {0} 处，调整 {1} 项）", offsets, ChangedTuning());
+        ImGui.AlignTextToFramePadding();
+        if (unsaved) Fit((saved ? Loc.T("有未保存的修改") : Loc.T("未保存")) + detail, Yellow);
+        else Fit((saved ? Loc.T("已保存修正") : Loc.T("默认值")) + detail, ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
+        if (_auxViews.Length == 0) return;
+        if (ImGui.Checkbox(Loc.F("使用辅助视角（{0} 张）", _auxViews.Length), ref _useAux)) RequestRetarget(_config.PushOnRelease);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(Loc.T("主图决定画面里看到的姿势，辅助视角只修正前后深度（主图猜不准的部分）。关掉可以对比效果\n")
+                             + string.Join("\n", _auxViews.Select(v => $"{Path.GetFileNameWithoutExtension(v.Path)}："
+                                 + Loc.F("{0} {1:+0;-0}°，采纳 {2:0}%", AuxViewsMenu.ViewLabel(v.View.View), v.View.Yaw, v.View.Share * 100)
+                                 + (AuxViewsMenu.Warning(v.View) is { } w ? "  " + w : ""))));
     }
 
     private void DrawStickTab()
@@ -1213,7 +1408,8 @@ public sealed partial class MainWindow : Window, IDisposable
         }
         DrawCorrectionBar();
         var avail = ImGui.GetContentRegionAvail();
-        var panel = _selected is null ? ImGui.GetTextLineHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
+        // 下方面板：没选关节时是一行勾选框（按控件行高留，按文字行高会被切掉一截）
+        var panel = _selected is null ? ImGui.GetFrameHeightWithSpacing() : ImGui.GetFrameHeightWithSpacing() * 4 + 4;
         var size = new Vector2(avail.X, Math.Max(140, avail.Y - panel));
         var origin = ImGui.GetCursorScreenPos();
         ImGui.InvisibleButton("##stick", size);
@@ -1375,7 +1571,10 @@ public sealed partial class MainWindow : Window, IDisposable
     /// <summary>拖动中只刷新预览，松手才应用到角色；右键恢复默认值。</summary>
     private void Slider(string label, ref float value, float min, float max, string format, float def, string tip)
     {
-        ImGui.SetNextItemWidth(Math.Max(120, ImGui.GetContentRegionAvail().X - 90));
+        // 右边统一留出调整页最长标签的宽度：所有滑杆右端对齐，标签排成一列（英文标签更长，也不会被裁掉）
+        var shown = label.Split("##")[0];
+        var labelW = Math.Max(_sliderLabelW, ImGui.CalcTextSize(shown).X + ImGui.GetStyle().ItemInnerSpacing.X);
+        ImGui.SetNextItemWidth(Math.Max(120 * ImGuiHelpers.GlobalScale, ImGui.GetContentRegionAvail().X - labelW));
         var changed = ImGui.SliderFloat(label, ref value, min, max, format);
         ItemTip(tip + Loc.F("\n右键恢复默认（{0:0.##}）", def));
         if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
@@ -1394,9 +1593,20 @@ public sealed partial class MainWindow : Window, IDisposable
         ItemTip(tip);
     }
 
+    // 调整页滑杆的标签列宽（每帧按当前语言算一次）
+    private float _sliderLabelW;
+    private static readonly string[] SliderLabels = ["强度##hand", "完全生效##near", "不再生效##far", "校正上限##upmax", "联动强度##helper"];
+
     private void DrawTuningTab()
     {
-        ImGui.SetNextItemWidth(110);
+        _sliderLabelW = AmplitudeGroups.Select(g => g.Label).Concat(SliderLabels)
+                                       .Max(l => ImGui.CalcTextSize(Loc.T(l).Split("##")[0]).X) + ImGui.GetStyle().ItemInnerSpacing.X;
+        if (_session is not null)
+        {
+            DrawCorrectionBar();
+            ImGui.Separator();
+        }
+        ImGui.SetNextItemWidth(110 * ImGuiHelpers.GlobalScale);
         var presetLabel = _preset == "illustration" ? Loc.T("插画") : Loc.T("照片");
         if (ImGui.BeginCombo("##preset", presetLabel))
         {
@@ -1407,21 +1617,18 @@ public sealed partial class MainWindow : Window, IDisposable
                     var offsets = _params.Offsets;
                     _params = LoadParams(key);
                     _params.Offsets = offsets;
-                    _savedParams = ParamsSnapshot(_params);
                     _config.DefaultPreset = key;
                     _pi.SavePluginConfig(_config);
                     RequestRetarget(_config.PushOnRelease);
                 }
             ImGui.EndCombo();
         }
-        ItemTip(Loc.T("预设：插画会把颈/头幅度设为 0.7（游戏实测合适）") + "\n" + Loc.T("调整过的值按预设自动保存，点右边的按钮恢复默认"));
+        ItemTip(Loc.T("预设：插画会把颈/头幅度设为 0.7（游戏实测合适）") + "\n"
+                + Loc.T("新图片都从预设默认值开始；这张图调好的值用上方「保存修正」存进这张图，下次打开自动恢复。右边按钮恢复默认"));
         ImGui.SameLine();
         if (IconButton("##resetAll", FontAwesomeIcon.UndoAlt, Loc.T("全部恢复预设值（含手动偏移）")))
         {
             _params = RetargetParams.Preset(_preset);
-            _correctionLoaded = false;
-            if (_config.SavedParams.Remove(_preset)) _pi.SavePluginConfig(_config);
-            _savedParams = ParamsSnapshot(_params);
             RequestRetarget(_config.PushOnRelease);
         }
 
@@ -1557,6 +1764,8 @@ public sealed partial class MainWindow : Window, IDisposable
             ImGui.EndCombo();
         }
         ItemTip(Loc.T("自动：游戏客户端是中文时用中文，否则看 Dalamud 界面语言，都不是中文则用英文"));
+        ImGui.SameLine();
+        if (ImGui.SmallButton(Loc.F("更新日志（{0}）", UpdateWindow.Current))) ShowChangelog?.Invoke();
 
         ImGui.Separator();
         ImGui.TextDisabled(Loc.T("识别后端（backend）"));
@@ -1605,7 +1814,7 @@ public sealed partial class MainWindow : Window, IDisposable
 
         var problem = BackendProcess.Validate(_config);
         if (problem is null) ImGui.TextColored(Green, Loc.T("路径有效"));
-        else ImGui.TextColored(Yellow, problem);
+        else Wrapped(problem, Yellow);
 
         changed |= DrawUpdateSection();
 
@@ -1636,8 +1845,8 @@ public sealed partial class MainWindow : Window, IDisposable
         }, Loc.T("关闭时与游戏界面一起隐藏（如 GPose 里隐藏界面截图）。界面不显示时可以打开试试"));
 
         ImGui.Separator();
-        ImGui.TextDisabled(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))));
-        ImGui.SameLine();
+        Wrapped(Loc.F("Posegraph HTTP（127.0.0.1:{0}，复刻镜头需要）：{1}", _config.Port, (_server.IsRunning ? Loc.T("运行中") : Loc.T("已停止"))),
+                ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
         if (ImGui.SmallButton(_server.IsRunning ? Loc.T("停止") : Loc.T("启动")))
         {
             if (_server.IsRunning) _server.Stop();
@@ -1659,16 +1868,24 @@ public sealed partial class MainWindow : Window, IDisposable
         }
     }
 
+    private static void Fit(string text, Vector4 color) => UiText.Fit(text, color);
+
+    /// <summary>按窗口宽度自动换行的彩色文字（长提示不会被右边裁掉）。</summary>
+    private static void Wrapped(string text, Vector4 color)
+    {
+        using (ImRaii.PushColor(ImGuiCol.Text, color))
+            ImGui.TextWrapped(text);
+    }
+
     /// <summary>设置页的后端更新区域。返回配置是否有改动。</summary>
     private bool DrawUpdateSection()
     {
         var changed = false;
         ImGui.Text(Loc.F("后端版本 {0}，插件 {1}", _installedBackend?.Version ?? Loc.T("未知"), BackendUpdater.PluginTag));
-        ImGui.SameLine();
         if (_packageRuntime is null)
-            ImGui.TextDisabled(Loc.T("（源码安装：请用 git 更新到同版本）"));
+            Wrapped(Loc.T("（源码安装：请用 git 更新到同版本）"), ImGui.GetStyle().Colors[(int)ImGuiCol.TextDisabled]);
         else if (_updater.Busy)
-            ImGui.TextColored(Yellow, _updater.Status ?? Loc.T("更新中…"));
+            Wrapped(_updater.Status ?? Loc.T("更新中…"), Yellow);
         else if (_backendOutdated)
         {
             if (IconButton("##updateBackend", FontAwesomeIcon.CloudDownloadAlt,
@@ -1719,10 +1936,12 @@ public sealed partial class MainWindow : Window, IDisposable
             }
             ItemTip(Loc.T(tip));
         }
-        ImGui.SetNextItemWidth(180);
+        // 下拉框占满到右侧标签前（英文选项更长），放不下时省略
+        var releaseW = Math.Max(180 * ImGuiHelpers.GlobalScale, ImGui.GetContentRegionAvail().X - ImGui.CalcTextSize(Loc.T("模型释放")).X - ImGui.GetStyle().ItemInnerSpacing.X);
+        ImGui.SetNextItemWidth(releaseW);
         var current = ReleasePolicies.FirstOrDefault(p => p.Seconds == _config.ReleaseAfter).Label is { } known
             ? Loc.T(known) : Loc.F("空闲 {0} 秒后释放", _config.ReleaseAfter);
-        if (ImGui.BeginCombo(Loc.T("模型释放"), current))
+        if (ImGui.BeginCombo(Loc.T("模型释放"), UiText.ComboPreview(current, releaseW)))
         {
             foreach (var (seconds, label) in ReleasePolicies)
                 if (ImGui.Selectable(Loc.T(label), _config.ReleaseAfter == seconds))

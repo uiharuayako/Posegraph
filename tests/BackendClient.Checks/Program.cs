@@ -15,6 +15,7 @@ var checks = new (string Name, Func<Task> Run)[]
     ("Accepts default one on older backend without confirmation", DefaultCompatible),
     ("Propagates non-success HTTP status and backend detail", BackendError),
     ("Sends current Accept-Language on every configuration request", LanguageHeader),
+    ("Preserves batch hold and escaped image names", BatchHold),
 };
 
 foreach (var (name, run) in checks)
@@ -136,6 +137,22 @@ static async Task LanguageHeader()
             "Accept-Language did not follow the current UI language on the same client");
     }
     finally { Loc.Lang = original; }
+}
+
+static async Task BatchHold()
+{
+    const string response = "{\"sessionId\":\"check\",\"name\":\"image\",\"imageSize\":[1,1],\"inferenceMs\":1,\"device\":\"cpu\",\"humans\":[]}";
+    using var backend = new LocalBackend(new MockResponse(200, response), new MockResponse(200, response));
+    using var client = new BackendClient(() => backend.Port);
+    const string name = "中文 & image?";
+    await client.CreateSessionAsync([1], name, hold: true);
+    await client.CreateSessionAsync([2], name);
+    var requests = await backend.Requests;
+    Assert(requests.All(request => request.Method == "POST" && request.Path == "/sessions" &&
+        request.Query!.Contains("name=" + Uri.EscapeDataString(name)) && request.Language == Loc.Lang),
+        "Session request lost its name or language");
+    Assert(requests[0].Query!.EndsWith("&hold=true") && !requests[1].Query!.Contains("hold="),
+        "Batch hold was lost or applied to an ordinary foreground request");
 }
 
 static void Assert(bool condition, string message)

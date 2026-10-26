@@ -11,6 +11,7 @@
   DELETE /sessions/{id}                删除图片及预识别缓存
   POST /sessions/{id}/retarget         按参数重定向（只算重定向，几十毫秒），返回 Brio 姿势、叠加层、火柴人、合理性提示
   POST /sessions/{id}/camera           按照片镜头设置 GPose 相机（经 Posegraph HTTP 闭环求解）
+  POST /sessions/{id}/views            挂上辅助视角（别的会话里识别好的同一姿势），重定向默认用融合结果（multiview.py）
   GET  /presets                        参数预设
   GET  /races                          支持的种族骨架（retarget/races.py）
   POST /shutdown                       退出服务
@@ -58,7 +59,12 @@ _recognition_strategy = settings.recognition_strategy
 if _recognition_strategy not in ("process", "shared"):
     raise ValueError("POSEGRAPH_RECOGNITION_STRATEGY must be process or shared")
 _parallel_pool: InferencePool | SharedInferencePool | None = None
+_active_pool_requests = 0
 _last_used = time.monotonic()
+# 插件批量识别（主图 + 辅助视角、拆分模式全部应用、批量队列）时请求带 hold：这张识别完先不释放，
+# 整批结束插件再调 /model/unload。插件中途退出没调时，按 HOLD_TIMEOUT 秒空闲兜底释放
+_held = False
+HOLD_TIMEOUT = 60
 
 PREVIEW_MAX_SIDE = 1280
 MAX_SESSIONS = 8
@@ -136,9 +142,11 @@ def _load_model() -> None:
 
 
 def _unload_model() -> None:
+    global _held
     with _model_lifecycle.exclusive(), _model_lock:
         _close_parallel_pool()
         _estimator.unload()
+        _held = False
 
 
 def _release_loop() -> None:
@@ -149,13 +157,17 @@ def _release_loop() -> None:
 
 
 def _release_idle_models() -> None:
-    idle = lambda: (_release_after > 0 and _model_info()["loaded"] and not _model_info()["loading"]
-                    and time.monotonic() - _last_used > _release_after)
+    global _held
+    def idle():
+        limit = HOLD_TIMEOUT if _release_after == 0 and _held else _release_after
+        info = _model_info()
+        return limit > 0 and info["loaded"] and not info["loading"] and time.monotonic() - _last_used > limit
     if idle():
         with _model_lifecycle.exclusive(), _model_lock:
             if idle():
                 _close_parallel_pool()
                 _estimator.unload()
+                _held = False
 
 
 def _model_info() -> dict:
@@ -230,7 +242,7 @@ class ModelConfig(BaseModel):
 @app.post("/model/config")
 def model_config(cfg: ModelConfig) -> dict:
     """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。"""
-    global _release_after, _recognition_parallelism, _recognition_strategy
+    global _release_after, _recognition_parallelism, _recognition_strategy, _held
     if cfg.device is not None and cfg.device not in ("auto", "cuda", "cpu"):
         raise HTTPException(400, tr("device 只能是 auto / cuda / cpu"))
     with _model_lifecycle.exclusive(), _model_lock:
@@ -245,6 +257,7 @@ def model_config(cfg: ModelConfig) -> dict:
             # attempt shutdown again, instead of treating it as a no-op update.
             _close_parallel_pool()
             _estimator.unload()
+            _held = False
         for key, value in changes.items():
             setattr(_estimator, key, value)
         _recognition_parallelism = next_parallelism
@@ -289,12 +302,13 @@ def _session(sid: str) -> Session:
 
 
 @app.post("/sessions")
-async def create_session(request: Request, name: str = "image") -> dict:
+async def create_session(request: Request, name: str = "image", hold: bool = False) -> dict:
+    """hold：后面还有同一批的图要识别，这张识别完先不按「立即释放」卸载模型。"""
     data = await request.body()
     if not data:
         raise HTTPException(400, tr("请求体为空"))
     # 识别约几秒，放到线程池里跑，期间 /health 仍能响应
-    rgb, result = await run_in_threadpool(_estimate, data)
+    rgb, result = await run_in_threadpool(_estimate, data, hold)
     humans = []
     for h in result.humans:
         humans.append({"joint_global_rots": h.joint_global_rots, "joint_coords": h.joint_coords,
@@ -351,15 +365,24 @@ def session_delete(sid: str) -> dict:
     return {"ok": True}
 
 
-def _estimate(data: bytes):
-    global _last_used
+def _estimate(data: bytes, hold: bool = False):
+    global _last_used, _held, _active_pool_requests
     rgb = _decode(data)
     with _model_lifecycle.inference():
-        try:
-            if _uses_inference_pool():
+        if _uses_inference_pool():
+            with _model_lock:
+                if not _active_pool_requests:
+                    _held = False
+                _active_pool_requests += 1
+                # A held batch request protects the whole concurrent group.
+                # Non-held peers cannot release a model still used by the batch.
+                _held |= hold
+            try:
                 try:
                     previous_load_error = _model_state["error"]
-                    result = _get_parallel_pool().estimate(rgb, _release_after, _lang.get())
+                    # The server coordinates group release, including requests
+                    # queued for a slot. A pool must not unload independently.
+                    result = _get_parallel_pool().estimate(rgb, -1, _lang.get())
                     # A successful retry supersedes an earlier preload failure.
                     # Keep a newer global error and every per-worker/pool error.
                     with _model_lock:
@@ -367,19 +390,25 @@ def _estimate(data: bytes):
                             _model_state["error"] = None
                 except InferenceFailure as error:
                     raise HTTPException(error.status, str(error)) from error
-            else:
+            finally:
                 with _model_lock:
-                    try:
-                        _load_serial_model()
-                    except Exception as ex:
-                        raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
-                    try:
-                        result = _estimator.estimate(rgb)
-                    finally:
-                        if _release_after == 0:
-                            _estimator.unload()
-        finally:
-            _last_used = time.monotonic()
+                    _active_pool_requests -= 1
+                    _last_used = time.monotonic()
+                    if not _active_pool_requests and _release_after == 0 and not _held:
+                        _close_parallel_pool()
+        else:
+            with _model_lock:
+                try:
+                    _load_serial_model()
+                except Exception as ex:
+                    raise HTTPException(503, tr("模型加载失败：{error}", error=ex))
+                try:
+                    result = _estimator.estimate(rgb)
+                finally:
+                    _last_used = time.monotonic()
+                    _held = hold
+                    if _release_after == 0 and not hold:
+                        _estimator.unload()
     if not result.humans:
         raise HTTPException(422, tr("未检测到人物"))
     return rgb, result
@@ -398,6 +427,7 @@ class RetargetRequest(BaseModel):
     stick: bool = True
     race: str | None = None         # 骨架编号 cXXXX（插件按角色外貌数据识别）；缺省时按 reference 的骨长推断
     trust_reference: bool = False   # 插件已清除过 Brio 姿势栈：骨长不符也按游戏实际值（Customize+、改体型 MOD）
+    use_aux: bool = True            # 挂了辅助视角时用融合结果
 
 
 def _ivcs(ref: BrioPose | None, race: dict) -> bool | None:
@@ -451,16 +481,41 @@ def _resolve_race(requested: str | None, ref: BrioPose | None) -> dict:
     return {**info, "source": source, "warnings": warnings}
 
 
-def _human(s: Session, person: int) -> dict:
+def _human(s: Session, person: int, use_aux: bool = True) -> dict:
     if not 0 <= person < len(s.humans):
         raise HTTPException(400, tr("人物序号超出范围（共 {count} 人）", count=len(s.humans)))
+    if use_aux and person == 0 and s.fused is not None:
+        return s.fused
     return s.humans[person]
+
+
+class ViewsRequest(BaseModel):
+    aux: list[str] = []    # 辅助图的会话（各取第 0 人）；空列表为去掉辅助视角
+
+
+@app.post("/sessions/{sid}/views")
+def session_views(sid: str, req: ViewsRequest) -> dict:
+    """融合在这里算一次存进会话（几十毫秒），之后的重定向直接用；辅助图的会话用完插件可以删掉。"""
+    from . import multiview
+
+    s = _session(sid)
+    aux = [_session(a).humans[0] for a in req.aux]
+    if not aux:
+        fused, views = None, None
+    else:
+        views = multiview.describe(s.humans[0], aux)
+        fused = multiview.fuse(s.humans[0], aux)
+    try:
+        _sessions.set_views(sid, fused, views)
+    except KeyError:
+        raise HTTPException(404, tr("会话不存在（后端重启过？请重新识别）"))
+    return {"views": views or []}
 
 
 @app.post("/sessions/{sid}/retarget")
 def session_retarget(sid: str, req: RetargetRequest) -> dict:
     s = _session(sid)
-    human = _human(s, req.person)
+    human = _human(s, req.person, req.use_aux)
     t0 = time.perf_counter()
     ref = BrioPose.loads(req.reference) if req.reference else None
     race = _resolve_race(req.race, ref)
@@ -484,6 +539,7 @@ class CameraRequest(BaseModel):
     params: tuning.RetargetParams = tuning.RetargetParams()
     actor: int | None = None
     race: str | None = None
+    use_aux: bool = True
 
 
 @app.post("/sessions/{sid}/camera")
@@ -493,7 +549,7 @@ def session_camera(sid: str, req: CameraRequest) -> dict:
     from .camera import framing_error, photo_camera_in_world, solve_gpose_camera
 
     s = _session(sid)
-    human = _human(s, req.person)
+    human = _human(s, req.person, req.use_aux)
     client = BridgeClient()
     pose_json = client.get_pose(req.actor)
     ref = BrioPose.loads(pose_json)

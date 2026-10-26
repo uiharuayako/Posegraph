@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    离线界面预览：不进游戏，用 Dalamud 的 cimgui 跑插件的真实窗口代码，软件光栅化成 PNG。
+    用于快速检查排版、制作 README / 教程 / 更新日志截图。见 README.md。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PlatformTarget>x64</PlatformTarget>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DalamudLibPath>$(AppData)\XIVLauncherCN\addon\Hooks\dev\</DalamudLibPath>
+    <PluginBin>$(MSBuildThisFileDirectory)..\..\Posegraph\bin\Release\</PluginBin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="3.116.1" />
+    <!-- Dalamud 与插件不复制到输出目录：运行时从原位置加载（Program.Resolve），避免和游戏里的版本混淆 -->
+    <Reference Include="Dalamud"><HintPath>$(DalamudLibPath)Dalamud.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Dalamud.Bindings.ImGui"><HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(DalamudLibPath)0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Posegraph"><HintPath>$(PluginBin)Posegraph.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+</Project>

@@ -3,7 +3,7 @@ using System.Net.Sockets;
 using System.Text;
 
 internal sealed record MockResponse(int StatusCode, string Body);
-internal sealed record CapturedRequest(string Method, string Path, string Body, string? Language, string? ContentType);
+internal sealed record CapturedRequest(string Method, string Path, string Body, string? Language, string? ContentType, string? Query = null);
 
 /// <summary>Real loopback HTTP, so production serialization, handlers and error parsing are exercised.</summary>
 internal sealed class LocalBackend : IDisposable
@@ -34,7 +34,7 @@ internal sealed class LocalBackend : IDisposable
             using var reader = new StreamReader(context.Request.InputStream);
             var body = await reader.ReadToEndAsync();
             requests.Add(new CapturedRequest(context.Request.HttpMethod, context.Request.Url!.AbsolutePath,
-                body, context.Request.Headers["Accept-Language"], context.Request.ContentType));
+                body, context.Request.Headers["Accept-Language"], context.Request.ContentType, context.Request.Url.Query));
             var bytes = Encoding.UTF8.GetBytes(response.Body);
             context.Response.StatusCode = response.StatusCode;
             context.Response.ContentType = "application/json; charset=utf-8";

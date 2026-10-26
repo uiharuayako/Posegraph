@@ -61,6 +61,14 @@ public sealed record RetargetResult(
     JsonElement Compensation, Overlay? Overlay, Stick? Stick, float ElapsedMs, RaceUsed? Race, bool ReferenceStale = false,
     bool? Ivcs = null);   // 游戏角色是否加载了 IVCS 骨骼（读到游戏姿势时才有）
 
+/// <summary>
+/// 一张辅助视角图相对主图的情况（backend multiview.describe）。Yaw：机位绕人物转了多少度（正 = 人物右侧）；
+/// View：same / left / right / back；Share：主要骨段平均采纳了多少；Conflict：主要骨段画面方向与主图平均差几度，Worst 为差得最多的骨段。
+/// </summary>
+public sealed record AuxView(float Yaw, string View, float Share, float Conflict, string Worst, float WorstDeg);
+
+public sealed record ViewsResult(AuxView[] Views);
+
 public sealed record CameraResult(float PositionErrorCm, float ForwardErrorDeg, float FovDeg, float TargetFovDeg,
                                   float FramingErrorPct, string[] Log);
 

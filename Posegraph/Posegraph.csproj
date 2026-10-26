@@ -1,7 +1,7 @@
 <Project Sdk="Dalamud.NET.SDK/15.0.0">
 
 	<PropertyGroup>
-		<Version>0.3.10.0</Version>
+		<Version>0.4.0.0</Version>
 		<Nullable>enable</Nullable>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<ImplicitUsings>enable</ImplicitUsings>
@@ -21,6 +21,12 @@
 	<ItemGroup>
 		<None Include="..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
 		<None Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
+	</ItemGroup>
+
+	<!-- 更新日志窗口的内容与横幅（横幅由 tools/UiPreview/make_banner.py 生成） -->
+	<ItemGroup>
+		<EmbeddedResource Include="Changelog\changelog.json" LogicalName="Posegraph.Changelog.changelog.json" />
+		<EmbeddedResource Include="Changelog\banner.png" LogicalName="Posegraph.Changelog.banner.png" />
 	</ItemGroup>
 
 </Project>

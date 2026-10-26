@@ -1,0 +1,148 @@
+{
+  "tagline": {
+    "zh": "照片和插画一键变成 Brio 姿势",
+    "en": "Turn photos and illustrations into Brio poses"
+  },
+  "entries": [
+    {
+      "version": "0.4.0",
+      "date": "",
+      "title": {
+        "zh": "拆分模式、辅助视角与新界面",
+        "en": "Split mode, extra views and a new look"
+      },
+      "items": {
+        "zh": [
+          "角色列表（拆分模式）：GPose 里的多个角色各绑一张图，一键全部应用；某个角色要细调时点「编辑」切到主窗口",
+          "辅助视角：给一张图挂上同一动作其他角度的图（最好是约 90° 的侧面），自动融合修正单张图猜不准的前后深度；主图里看到的姿势不会被改动",
+          "辅助视角在图库右键菜单里管理（从文件、剪切板添加，或把选中的图挂上来），不占用图库网格；文件名为「主图名-1」的图导入时自动挂上",
+          "批量识别只加载一次模型：主图连同辅助视角、全部应用、批量队列都更快（模型设置为“识别后立即释放”时尤其明显）",
+          "全新的界面主题与排版：深灰底、青蓝强调色；工具栏分三行，默认窗口大小下不再裁切",
+          "新增更新日志窗口（就是这个），在设置页可以随时再打开",
+          "调整页的数值（幅度、手部补偿、站姿、辅助骨）随「保存修正」存进每张图；新图片都从默认值开始，不再沿用上一张图调过的值。调整页顶部也有保存按钮，有未保存的修改时会提示",
+          "窗口变窄或英文界面下，放不下的文字以「…」结尾、悬停显示全文；底部状态按宽度换行"
+        ],
+        "en": [
+          "Character list (split mode): bind one image to each GPose character and apply them all at once; click Edit to fine-tune one in the main window",
+          "Extra views: attach images of the same pose from other angles (a ~90° side view is best). They are fused automatically to fix the front/back depth a single image can't tell, without changing the pose you see in the main image",
+          "Manage extra views from the library's right-click menu (add from files or the clipboard, or attach selected images); they don't clutter the library grid. Images named \"main-1\" are attached automatically on import",
+          "Batch recognition loads the model only once: main image plus extra views, Apply all and the batch queue are all faster (most noticeable with \"release after recognition\")",
+          "New theme and layout: dark gray with a teal accent; the toolbar now uses three rows and no longer gets cut off at the default window size",
+          "New changelog window (this one); reopen it any time from Settings",
+          "Tuning values (amplitude, hand compensation, stance, helper bones) are saved with each image via \"Save correction\"; new images start from the defaults instead of the last image's values. The Tuning tab now has the save button too and shows when there are unsaved changes",
+          "Text that doesn't fit in a narrow window or in English ends with \"…\" and shows in full on hover; the status line wraps"
+        ]
+      }
+    },
+    {
+      "version": "0.3.10",
+      "date": "2026-10-26",
+      "title": {
+        "zh": "图库与女性骨架",
+        "en": "Image library and female skeletons"
+      },
+      "items": {
+        "zh": [
+          "图库窗口：导入（多选、文件夹、拖放、剪切板）、文件夹 / 标签 / 收藏分类、重命名、移动、删除到回收站",
+          "识别结果按图片内容缓存，再次打开不用重新识别；批量识别队列",
+          "3D 页「保存修正」：手动偏移和调整参数跟着图片走，打开时自动恢复",
+          "存到 Brio 姿势库（带预览图和标签）",
+          "女性骨架适配；膝、肘、肩辅助骨规则按游戏内采样更新",
+          "拖到主窗口的图不再自动存入图库，识别后由你决定是否存入（按内容查重，附带 3D 修正）",
+          "导入、剪切板读取的思路来自 uiharuayako 的 PR"
+        ],
+        "en": [
+          "Library window: import (multi-select, folders, drag & drop, clipboard), organize with folders, tags and favorites, rename, move, delete to the Recycle Bin",
+          "Recognition results are cached by image content, so reopening an image doesn't rerun the model; batch recognition queue",
+          "\"Save correction\" on the 3D tab: manual offsets and tuning travel with the image and are restored when it is opened",
+          "Save to the Brio pose library (with preview and tags)",
+          "Female skeleton support; knee, elbow and shoulder helper bone rules updated from in-game sampling",
+          "Images dropped on the main window are no longer added to the library automatically; you choose after recognition (deduplicated by content, with 3D corrections)",
+          "Import and clipboard ideas from uiharuayako's PR"
+        ]
+      }
+    },
+    {
+      "version": "0.3.9",
+      "date": "2026-10-26",
+      "title": {
+        "zh": "多角色与 IVCS",
+        "en": "Multiple characters and IVCS"
+      },
+      "items": {
+        "zh": [
+          "切换角色不再重置该角色在 Brio 里的姿势，每个角色的状态单独记住",
+          "角色列表只列人形角色，过滤宠物、坐骑等",
+          "检测 IVCS：没加载时把手指第三节的弯曲折算到第二节，状态栏显示 IVCS 图标",
+          "修复多次换种族后骨长错乱",
+          "许可证改为 MIT"
+        ],
+        "en": [
+          "Switching characters no longer resets their Brio pose; each character's state is remembered separately",
+          "The character list only shows humanoid characters (no pets, mounts, etc.)",
+          "IVCS detection: without IVCS, the third finger joint's bend is folded into the second; IVCS icon in the status bar",
+          "Fixed bone lengths going wrong after changing race several times",
+          "License changed to MIT"
+        ]
+      }
+    },
+    {
+      "version": "0.3.7",
+      "date": "2026-10-25",
+      "title": {
+        "zh": "GPose 体验改进",
+        "en": "GPose improvements"
+      },
+      "items": {
+        "zh": [
+          "GPose 里始终显示界面；进入 GPose 时自动打开的界面在退出时自动关闭",
+          "换种族后自动重新读取参考姿势并重新应用",
+          "调整值按预设自动保存",
+          "加入插件图标"
+        ],
+        "en": [
+          "The UI always shows in GPose; a window opened automatically on entering GPose closes when you leave",
+          "After a race change the reference pose is reread and reapplied automatically",
+          "Tuning values are saved per preset",
+          "Plugin icon"
+        ]
+      }
+    },
+    {
+      "version": "0.3.1",
+      "date": "2026-10-25",
+      "title": {
+        "zh": "后端自动更新",
+        "en": "Backend self-update"
+      },
+      "items": {
+        "zh": [
+          "一键包用户可以在设置页直接更新后端"
+        ],
+        "en": [
+          "Backend package users can update the backend from Settings"
+        ]
+      }
+    },
+    {
+      "version": "0.3.0",
+      "date": "2026-10-25",
+      "title": {
+        "zh": "首个公开版本",
+        "en": "First public release"
+      },
+      "items": {
+        "zh": [
+          "从照片或插画识别人物姿势，经 Brio 应用到 GPose 角色",
+          "支持全部可玩种族、复刻照片镜头、调整滑杆、导出 .pose",
+          "低显存 / CPU 模式"
+        ],
+        "en": [
+          "Recognize the pose in a photo or illustration and apply it to your GPose character through Brio",
+          "All playable races, camera matching, tuning sliders, .pose export",
+          "Low-VRAM / CPU mode"
+        ]
+      }
+    }
+  ]
+}

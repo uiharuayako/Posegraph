@@ -12,7 +12,9 @@ await DuplicateContentAndForeground();
 await StopAndDispose();
 await ConfigurationAndArchiveFailure();
 await CorruptCacheAndConcurrentSaves();
-Console.WriteLine("5 library recognition integration scenarios passed (real service/library/client; loopback HTTP).");
+await BatchHoldAndAuxiliaryViews();
+await NestedBatchLifecycle();
+Console.WriteLine("7 library recognition integration scenarios passed (real service/library/client; loopback HTTP).");
 
 static void Check(bool value, string message)
 {
@@ -135,6 +137,62 @@ static async Task CorruptCacheAndConcurrentSaves()
     Console.WriteLine("PASS corrupted-cache repair and serialized, lossless library index saves");
 }
 
+static async Task BatchHoldAndAuxiliaryViews()
+{
+    using var f = new Fixture(3) { ReleaseImmediately = true };
+    var main = f.Image("main", 30);
+    var auxiliary = f.Image("side", 31);
+    var hash = f.Library.RememberHash(main, File.ReadAllBytes(main));
+    var attached = f.Library.AddAux(hash, [auxiliary]).Single();
+    f.Service.Enqueue([main]);
+    var mainJob = await f.Backend.Next();
+    Check(mainJob.Name == "main" && mainJob.Hold, "main batch request did not retain the model");
+    mainJob.Completion.SetResult(true);
+    var auxJob = await f.Backend.Next();
+    Check(auxJob.Name == "side" && auxJob.Hold, "auxiliary pre-recognition was skipped or lost its model hold");
+    auxJob.Completion.SetResult(true);
+    await Idle(f.Service);
+    Check(f.Backend.Created == 2 && f.Backend.Unloaded == 1 && f.Backend.Deleted.Count == 2 &&
+          f.Library.HasCache(hash) && f.Library.HasCache(f.Library.Hash(attached)),
+          "batch did not cache main/auxiliary results, clean sessions and unload once");
+    var views = await f.Service.AttachAuxAsync("foreground-main", hash);
+    Check(views.Length == 1 && views[0].Path == attached && f.Service.ViewOf(attached)?.View == "left" &&
+          f.Backend.Restored == 1 && f.Backend.Created == 2 && f.Backend.Unloaded == 1 && f.Backend.Deleted.Count == 3,
+          "auxiliary fusion lost view metadata, repeated inference or leaked the cached temporary session");
+    f.Backend.ViewsError = true;
+    try { await f.Service.AttachAuxAsync("foreground-main", hash); throw new Exception("Expected view failure"); }
+    catch (BackendException error) when (error.StatusCode == 500) { }
+    Check(f.Backend.Deleted.Count == 4 && f.Backend.Unloaded == 1,
+          "failed auxiliary fusion leaked a restored session or unloaded a cache-only batch");
+    Console.WriteLine("PASS 0.4 batch hold, auxiliary pre-recognition/cache/view metadata and failure cleanup");
+}
+
+static async Task NestedBatchLifecycle()
+{
+    using var f = new Fixture(1) { ReleaseImmediately = true };
+    var outer = f.Service.Batch();
+    var inner = f.Service.Batch();
+    var path = f.Image("nested", 50);
+    var opening = f.Service.OpenAsync(path);
+    var job = await f.Backend.Next();
+    Check(job.Hold, "nested batch did not hold its foreground inference");
+    job.Completion.SetResult(true);
+    await opening;
+    await inner.DisposeAsync();
+    Check(f.Backend.Unloaded == 0 && !f.Service.Completion.IsCompleted, "inner batch released the model or was not tracked");
+    await outer.DisposeAsync();
+    await outer.DisposeAsync();
+    Check(f.Backend.Unloaded == 1, "nested/idempotent batch disposal did not release exactly once");
+    await using (f.Service.Batch()) await f.Service.OpenAsync(path);
+    Check(f.Backend.Unloaded == 1, "cache-only batch unnecessarily unloaded the model");
+    var direct = f.Service.OpenAsync(f.Image("single", 51));
+    var directJob = await f.Backend.Next();
+    Check(!directJob.Hold, "ordinary foreground request acquired a batch hold");
+    directJob.Completion.SetResult(true);
+    await direct;
+    Console.WriteLine("PASS nested/idempotent batch lifetime, cache-only batches and ordinary foreground requests");
+}
+
 sealed class Fixture : IDisposable
 {
     public readonly string Directory = Path.Combine(Path.GetTempPath(), "Posegraph-LibraryChecks-" + Guid.NewGuid().ToString("N"));
@@ -143,13 +201,14 @@ sealed class Fixture : IDisposable
     public readonly ImageLibrary Library;
     public readonly RecognitionService Service;
     public int Parallelism;
+    public bool ReleaseImmediately;
     public Fixture(int parallelism)
     {
         System.IO.Directory.CreateDirectory(Directory);
         Library = new ImageLibrary(Directory, Directory);
         Client = new BackendClient(() => Backend.Port);
         Parallelism = parallelism;
-        Service = new RecognitionService(Library, Client, () => Parallelism);
+        Service = new RecognitionService(Library, Client, () => Parallelism, () => ReleaseImmediately);
     }
     public string Image(string name, int marker)
     {
@@ -172,16 +231,16 @@ sealed class Fixture : IDisposable
             throw new InvalidOperationException("Unexpected fixture directory");
     }
 }
-sealed record Job(string Id, TaskCompletionSource<bool> Completion);
+sealed record Job(string Id, TaskCompletionSource<bool> Completion, string Name, bool Hold);
 sealed class ScriptedBackend : IDisposable
 {
     private readonly HttpListener _listener = new();
     private readonly Channel<Job> _jobs = Channel.CreateUnbounded<Job>();
     public readonly ConcurrentQueue<string> Deleted = new();
     public readonly ConcurrentQueue<int> Configured = new();
-    public int Created, Restored, Peak;
+    public int Created, Restored, Peak, Unloaded;
     private int _active, _ids;
-    public bool ConfigError, ArchiveError, RejectArchive;
+    public bool ConfigError, ArchiveError, RejectArchive, ViewsError;
     public int Port { get; }
     public ScriptedBackend()
     {
@@ -209,6 +268,19 @@ sealed class ScriptedBackend : IDisposable
             Configured.Enqueue(limit); status = ConfigError ? 422 : 200;
             body = JsonSerializer.Serialize(new { model = new { config = new { recognitionParallelism = limit } } });
         }
+        else if (path == "/model/unload")
+        {
+            Interlocked.Increment(ref Unloaded);
+            body = "{}";
+        }
+        else if (path.EndsWith("/views"))
+        {
+            using var doc = await JsonDocument.ParseAsync(req.InputStream);
+            var count = doc.RootElement.GetProperty("aux").GetArrayLength();
+            status = ViewsError ? 500 : 200;
+            body = ViewsError ? "{\"detail\":\"view failure\"}" : JsonSerializer.Serialize(new
+                { views = Enumerable.Range(0, count).Select(_ => new { yaw = 90, view = "left", share = .5, conflict = 0, worst = "", worstDeg = 0 }).ToArray() });
+        }
         else if (path == "/sessions/archive")
         {
             Interlocked.Increment(ref Restored);
@@ -222,7 +294,7 @@ sealed class ScriptedBackend : IDisposable
             Interlocked.Increment(ref Created);
             var active = Interlocked.Increment(ref _active);
             int previous; do { previous = Peak; } while (active > previous && Interlocked.CompareExchange(ref Peak, active, previous) != previous);
-            var job = new Job(id, new(TaskCreationOptions.RunContinuationsAsynchronously));
+            var job = new Job(id, new(TaskCreationOptions.RunContinuationsAsynchronously), req.QueryString["name"]!, req.QueryString["hold"] == "true");
             await _jobs.Writer.WriteAsync(job);
             var ok = await job.Completion.Task; Interlocked.Decrement(ref _active);
             status = ok ? 200 : 500;

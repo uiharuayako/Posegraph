@@ -21,13 +21,13 @@ namespace Posegraph.UI;
 public sealed class LibraryWindow : Window, IDisposable
 {
     public const string ExternalDragLabel = "PosegraphImage";
-    private const string InternalDragLabel = "PosegraphLibraryItems";
+    public const string InternalDragLabel = "PosegraphLibraryItems";
 
-    private static readonly Vector4 Green = new(0.35f, 0.85f, 0.4f, 1);
-    private static readonly Vector4 Yellow = new(1f, 0.8f, 0.25f, 1);
-    private static readonly Vector4 Red = new(1f, 0.35f, 0.3f, 1);
-    private static readonly Vector4 Grey = new(0.6f, 0.6f, 0.6f, 1);
-    private static readonly Vector4 Blue = new(0.45f, 0.7f, 1f, 1);
+    private static readonly Vector4 Green = PosegraphTheme.Green;
+    private static readonly Vector4 Yellow = PosegraphTheme.Yellow;
+    private static readonly Vector4 Red = PosegraphTheme.Red;
+    private static readonly Vector4 Grey = PosegraphTheme.Grey;
+    private static readonly Vector4 Blue = PosegraphTheme.Blue;
 
     private readonly Configuration _config;
     private readonly IDalamudPluginInterface _pi;
@@ -41,6 +41,7 @@ public sealed class LibraryWindow : Window, IDisposable
     private readonly Action<string> _openInMain;
     private readonly Func<string, Task<string>> _saveToBrio;
     private readonly Func<bool> _backendOnline;
+    private readonly AuxViewsMenu _auxMenu;
     private readonly FileDialogManager _fileDialog = new();
 
     private string _folder;
@@ -53,6 +54,7 @@ public sealed class LibraryWindow : Window, IDisposable
 
     private readonly List<string> _selection = new();
     private string? _anchor;
+    private string? _contextPath;   // 右键点的那一项（辅助视角挂在它上面）
     private volatile string[]? _pendingSelection;   // 后台导入完成后要选中的新图片（下一帧在绘制线程里应用）
 
     // 弹窗
@@ -66,7 +68,8 @@ public sealed class LibraryWindow : Window, IDisposable
 
     public LibraryWindow(Configuration config, IDalamudPluginInterface pi, ImageLibrary library, RecognitionService recognition,
                          ITextureProvider textures, ITextureReadbackProvider readback, IDragDropManager dragDrop, IPluginLog log,
-                         Action<string> openInMain, Func<string, Task<string>> saveToBrio, Func<bool> backendOnline)
+                         Action<string> openInMain, Func<string, Task<string>> saveToBrio, Func<bool> backendOnline,
+                         AuxViewsMenu auxMenu)
         : base(Loc.T("Posegraph 图库") + "###PosegraphLibrary")
     {
         _config = config;
@@ -80,6 +83,7 @@ public sealed class LibraryWindow : Window, IDisposable
         _openInMain = openInMain;
         _saveToBrio = saveToBrio;
         _backendOnline = backendOnline;
+        _auxMenu = auxMenu;
         _folder = Directory.Exists(config.LibraryFolder) && library.SourceRootOf(config.LibraryFolder, config.LibrarySources) is not null
             ? config.LibraryFolder : library.Root;
         Size = new Vector2(760, 560);
@@ -95,6 +99,10 @@ public sealed class LibraryWindow : Window, IDisposable
     }
 
     public override void OnClose() => _library.Save();
+
+    public override void PreDraw() => PosegraphTheme.Push();
+
+    public override void PostDraw() => PosegraphTheme.Pop();
 
     /// <summary>图库内容在别处变了（主窗口存入了新图），下一帧重新列目录。</summary>
     public void Refresh() => _refresh = true;
@@ -159,6 +167,9 @@ public sealed class LibraryWindow : Window, IDisposable
 
     /// <summary>系统拖动正悬停在图库窗口上（上一帧）：拖动提示据此显示"导入到图库"而不是"导入并识别"。</summary>
     public bool ExternalDragHovered { get; private set; }
+
+    /// <summary>正在从图库拖出的图片（拆分模式的角色列表接收拖放时读取）。</summary>
+    public string[] DraggedImages => _selection.Where(File.Exists).ToArray();
 
     /// <summary>当前文件夹名（拖动提示用）。</summary>
     public string FolderName => Path.GetFileName(_folder.TrimEnd('\\'));
@@ -390,6 +401,7 @@ public sealed class LibraryWindow : Window, IDisposable
         }
         if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
         {
+            _contextPath = path;
             if (!selected)
             {
                 _selection.Clear();
@@ -405,7 +417,7 @@ public sealed class LibraryWindow : Window, IDisposable
                 _selection.Add(path);
             }
             ImGui.SetDragDropPayload(InternalDragLabel, ReadOnlySpan<byte>.Empty, ImGuiCond.None);
-            ImGui.TextUnformatted(Loc.F("移动 {0} 项", _selection.Count));
+            ImGui.TextUnformatted(Loc.F("移动 {0} 项（图片也可以拖到角色列表里绑定）", _selection.Count));
             ImGui.EndDragDropSource();
         }
         if (isFolder) MoveDropTarget(path);
@@ -524,11 +536,23 @@ public sealed class LibraryWindow : Window, IDisposable
                 right -= 4;
             }
             // 在 3D 页保存过修正
-            if (_library.KnownHash(path) is { } sha && _library.HasCorrection(sha))
+            var sha = _library.KnownHash(path);
+            if (sha is not null && _library.HasCorrection(sha))
             {
                 var s = FontAwesomeIcon.SlidersH.ToIconString();
                 right -= ImGui.CalcTextSize(s).X;
                 dl.AddText(pos + new Vector2(right, 3), ImGui.GetColorU32(Blue), s);
+                right -= 4;
+            }
+            // 挂了辅助视角：图标下面写张数
+            if (sha is not null && _library.AuxCount(sha) is var aux and > 0)
+            {
+                var s = FontAwesomeIcon.Clone.ToIconString();
+                right -= ImGui.CalcTextSize(s).X;
+                dl.AddText(pos + new Vector2(right, 3), ImGui.GetColorU32(Blue), s);
+                var h = ImGui.GetTextLineHeight();
+                using (ImRaii.PushFont(UiBuilder.DefaultFont))
+                    dl.AddText(pos + new Vector2(right + 2, 3 + h), ImGui.GetColorU32(Blue), aux.ToString());
             }
         }
     }
@@ -558,6 +582,8 @@ public sealed class LibraryWindow : Window, IDisposable
             _ => StatusIcon(path).Icon is not null ? Loc.T("\n已识别（有缓存，打开不用重新识别）") : "",
         };
         if (_library.KnownHash(path) is { } sha && _library.HasCorrection(sha)) text += Loc.T("\n有保存的修正（打开时自动恢复）");
+        if (_library.KnownHash(path) is { } h && _library.AuxCount(h) is var aux and > 0)
+            text += Loc.F("\n挂了 {0} 张辅助视角图（右键「辅助视角」管理）", aux);
         return text + Loc.T("\n双击打开到主窗口，右键更多操作");
     }
 
@@ -637,7 +663,7 @@ public sealed class LibraryWindow : Window, IDisposable
         if (_status.Length > 0)
         {
             ImGui.SameLine();
-            ImGui.TextColored(_statusColor, _status);
+            UiText.Fit(_status, _statusColor);
         }
     }
 
@@ -650,6 +676,21 @@ public sealed class LibraryWindow : Window, IDisposable
         if (single is not null && File.Exists(single) && ImGui.MenuItem(Loc.T("打开到主窗口"))) _openInMain(single);
         if (single is not null && Directory.Exists(single) && ImGui.MenuItem(Loc.T("打开文件夹"))) Navigate(single);
         if (images.Count > 0 && ImGui.MenuItem(Loc.F("识别（{0} 张）", images.Count))) Recognize(images);
+        // 辅助视角挂在右键点的那张图上；同时选中的其他图可以移过来
+        var main = _contextPath is not null && File.Exists(_contextPath) ? _contextPath : single is not null && File.Exists(single) ? single : null;
+        if (main is not null)
+        {
+            var count = _library.KnownHash(main) is { } mainSha ? _library.AuxCount(mainSha) : 0;
+            if (ImGui.BeginMenu(count > 0 ? Loc.F("辅助视角（{0}）", count) : Loc.T("辅助视角")))
+            {
+                _auxMenu.Draw(main, images, (text, color) =>
+                {
+                    SetStatus(text, color);
+                    _refresh = true;
+                });
+                ImGui.EndMenu();
+            }
+        }
         ImGui.Separator();
         if (images.Count > 0)
         {
@@ -672,7 +713,7 @@ public sealed class LibraryWindow : Window, IDisposable
         if (single is not null && ImGui.MenuItem(Loc.T("在资源管理器中显示"))) ShowInExplorer(single, true);
         ImGui.Separator();
         if (images.Count > 0 && ImGui.MenuItem(Loc.F("存到 Brio 姿势库（{0} 张）", images.Count))) SaveToBrio(images);
-        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.F("用当前的调整参数和种族计算姿势，保存到 {0}，在 Brio 资料库里直接能用。没识别过的会先识别", BrioPoseLibrary.Folder));
+        if (ImGui.IsItemHovered()) ImGui.SetTooltip(Loc.F("用每张图保存的修正（没有就用默认值）和当前种族计算姿势，保存到 {0}，在 Brio 资料库里直接能用。没识别过的会先识别", BrioPoseLibrary.Folder));
         ImGui.Separator();
         if (items.Count > 0 && ImGui.MenuItem(Loc.F("删除到回收站（{0} 项）", items.Count))) OpenPopup("delete", items, "");
     }
@@ -858,7 +899,9 @@ public sealed class LibraryWindow : Window, IDisposable
             try
             {
                 var r = _library.Import(paths, folder, root);
-                var text = Loc.F("已导入 {0} 张", r.Added.Count);
+                var attached = _library.AttachNumbered(r.Added);
+                var text = Loc.F("已导入 {0} 张", r.Added.Count - attached);
+                if (attached > 0) text += Loc.F("，{0} 张按文件名（主图名-1）挂为辅助视角", attached);
                 if (r.Duplicates.Count > 0) text += Loc.F("，{0} 张图库里已有（已跳过，已选中原图）", r.Duplicates.Count);
                 if (r.OverLimit > 0) text += Loc.F("，超过上限跳过 {0} 张", r.OverLimit);
                 SetStatus(text, r.Duplicates.Count > 0 || r.OverLimit > 0 ? Yellow : Green);
@@ -922,6 +965,7 @@ public sealed class LibraryWindow : Window, IDisposable
         _ = Task.Run(async () =>
         {
             var saved = 0;
+            await using var batch = _recognition.Batch();   // 整批只加载一次模型
             foreach (var image in images)
             {
                 try

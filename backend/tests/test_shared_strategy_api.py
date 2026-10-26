@@ -1,6 +1,8 @@
 """Opt-in backend strategy contracts, without loading model weights or Torch."""
 import sys
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,12 +27,16 @@ class FakeEstimator:
     def unload(self):
         self.loaded = False
 
+    def estimate(self, rgb):
+        return SimpleNamespace(humans=[1])
+
 
 class FakePool:
     def __init__(self, parallelism, config):
         self.parallelism, self.config = parallelism, dict(config)
         self.loaded, self.closed = False, False
         self.estimates = 0
+        self.release_policies = []
 
     @property
     def states(self):
@@ -42,6 +48,7 @@ class FakePool:
 
     def estimate(self, rgb, release_after, language):
         self.estimates += 1
+        self.release_policies.append(release_after)
         self.loaded = True
         return SimpleNamespace(humans=[1])
 
@@ -57,6 +64,7 @@ class SharedStrategyApiTests(unittest.TestCase):
             "_estimator": FakeEstimator(), "_parallel_pool": None,
             "_model_lifecycle": ModelLifecycle(), "_recognition_parallelism": 1,
             "_recognition_strategy": "process", "_release_after": -1,
+            "_held": False, "_active_pool_requests": 0,
             "_model_state": {"loading": False, "error": None},
         }.items():
             self.stack.enter_context(patch.object(service, key, value))
@@ -192,6 +200,143 @@ class SharedStrategyApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.factory.assert_not_called()
         self.assertFalse(service._estimator.loaded)
+
+    def test_serial_hold_retains_model_until_nonheld_request(self):
+        service._release_after = 0
+        with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
+            service._estimate(b"image", hold=True)
+            self.assertTrue(service._estimator.loaded)
+            self.assertTrue(service._held)
+            service._estimate(b"image", hold=False)
+        self.assertFalse(service._estimator.loaded)
+        self.assertFalse(service._held)
+
+    def test_parallel_hold_protects_nonheld_peers_and_next_group_can_release(self):
+        for strategy in ("process", "shared"):
+            with self.subTest(strategy=strategy):
+                entered = [threading.Event(), threading.Event()]
+                release = [threading.Event(), threading.Event()]
+                class BlockingPool(FakePool):
+                    def estimate(self, rgb, release_after, language):
+                        result = super().estimate(rgb, release_after, language)
+                        if rgb < 2:
+                            entered[rgb].set()
+                            if not release[rgb].wait(3):
+                                raise RuntimeError("test did not release inference")
+                        return result
+                service.model_config(service.ModelConfig(recognition_strategy=strategy,
+                                                         recognition_parallelism=2, release_after=0))
+                with patch.object(service, "InferencePool", side_effect=BlockingPool), \
+                        patch.object(service, "SharedInferencePool", side_effect=BlockingPool), \
+                        patch.object(service, "_decode", side_effect=lambda data: data), \
+                        ThreadPoolExecutor(max_workers=2) as executor:
+                    try:
+                        first = executor.submit(service._estimate, 0, False)
+                        self.assertTrue(entered[0].wait(3))
+                        second = executor.submit(service._estimate, 1, True)
+                        self.assertTrue(entered[1].wait(3))
+                        pool = service._parallel_pool
+                        release[0].set()
+                        first.result(3)
+                        self.assertFalse(pool.closed)
+                        release[1].set()
+                        second.result(3)
+                        self.assertFalse(pool.closed)
+                        self.assertTrue(service._held)
+                        self.assertEqual(service._active_pool_requests, 0)
+                        service._estimate(2, False)
+                        self.assertTrue(pool.closed)
+                        self.assertFalse(service._held)
+                        self.assertEqual(pool.release_policies, [-1, -1, -1])
+                    finally:
+                        for event in release:
+                            event.set()
+
+    def test_hold_idle_timeout_releases_serial_and_parallel_models(self):
+        for strategy, parallelism in (("process", 1), ("shared", 2)):
+            with self.subTest(strategy=strategy):
+                service.model_config(service.ModelConfig(recognition_strategy=strategy,
+                                                         recognition_parallelism=parallelism, release_after=0))
+                with patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)):
+                    service._estimate(b"image", hold=True)
+                self.assertTrue(service._model_info()["loaded"])
+                with patch.object(service.time, "monotonic", return_value=service._last_used + service.HOLD_TIMEOUT - 1):
+                    service._release_idle_models()
+                self.assertTrue(service._model_info()["loaded"])
+                with patch.object(service.time, "monotonic", return_value=service._last_used + service.HOLD_TIMEOUT + 1):
+                    service._release_idle_models()
+                self.assertFalse(service._model_info()["loaded"])
+                self.assertFalse(service._held)
+
+    def test_hold_does_not_bypass_exclusive_unload_or_configuration(self):
+        for action in (service._unload_model,
+                       lambda: service.model_config(service.ModelConfig(device="cuda"))):
+            with self.subTest(action=action):
+                entered, release, writer_started = threading.Event(), threading.Event(), threading.Event()
+                class BlockingPool(FakePool):
+                    def estimate(self, rgb, release_after, language):
+                        result = super().estimate(rgb, release_after, language)
+                        entered.set()
+                        if not release.wait(3):
+                            raise RuntimeError("test did not release inference")
+                        return result
+                def change():
+                    writer_started.set()
+                    return action()
+                service.model_config(service.ModelConfig(recognition_strategy="shared", device="cpu", release_after=0))
+                with patch.object(service, "SharedInferencePool", side_effect=BlockingPool), \
+                        patch.object(service, "_decode", return_value=np.zeros((2, 2, 3), dtype=np.uint8)), \
+                        ThreadPoolExecutor(max_workers=2) as executor:
+                    try:
+                        recognition = executor.submit(service._estimate, b"image", True)
+                        self.assertTrue(entered.wait(3))
+                        pool = service._parallel_pool
+                        writer = executor.submit(change)
+                        self.assertTrue(writer_started.wait(3))
+                        self.assertFalse(release.wait(.05))
+                        self.assertFalse(writer.done())
+                        self.assertFalse(pool.closed)
+                        release.set()
+                        recognition.result(3)
+                        writer.result(3)
+                        self.assertTrue(pool.closed)
+                        self.assertFalse(service._held)
+                    finally:
+                        release.set()
+
+    def test_create_session_forwards_hold_query(self):
+        with patch.object(service, "_estimate", side_effect=service.HTTPException(422, "fake result")) as estimate, \
+                TestClient(service.app) as client:
+            response = client.post("/sessions?hold=true", content=b"image")
+        self.assertEqual(response.status_code, 422)
+        estimate.assert_called_once_with(b"image", True)
+
+    def test_multiview_writeback_uses_current_cache_and_keeps_delete_final(self):
+        from posegraph.session_cache import Session, SessionCache
+        cache = SessionCache(1)
+        self.addCleanup(cache.close)
+        original, auxiliary, fused = {"pose": "base"}, {"pose": "aux"}, {"pose": "fused"}
+        cache["base"] = Session("base", "base", (2, 2), b"png", [original], 1)
+        cache["aux"] = Session("aux", "aux", (2, 2), b"png", [auxiliary], 1)
+        views = [{"kind": "back"}]
+        with patch.object(service, "_sessions", cache), \
+                patch("posegraph.multiview.describe", return_value=views), \
+                patch("posegraph.multiview.fuse", return_value=fused):
+            # Reading aux spills the main session while fusion still holds its old object.
+            self.assertEqual(service.session_views("base", service.ViewsRequest(aux=["aux"])), {"views": views})
+            self.assertEqual(cache["base"].fused, fused)
+            self.assertEqual(service._human(cache["base"], 0), fused)
+            self.assertEqual(service._human(cache["base"], 0, use_aux=False), original)
+            self.assertEqual(service.session_views("base", service.ViewsRequest()), {"views": []})
+            self.assertIsNone(cache["base"].fused)
+            def delete_during_fusion(*args):
+                cache.discard("base")
+                return fused
+            with patch("posegraph.multiview.fuse", side_effect=delete_during_fusion):
+                with self.assertRaises(service.HTTPException) as failure:
+                    service.session_views("base", service.ViewsRequest(aux=["aux"]))
+            self.assertEqual(failure.exception.status_code, 404)
+            self.assertNotIn("base", cache)
 
 
 if __name__ == "__main__":

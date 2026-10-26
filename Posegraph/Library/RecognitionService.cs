@@ -11,7 +11,8 @@ public sealed record RecognitionStatus(RecognitionState State, string? Error = n
 /// Content-hash recognition cache and bounded batch queue. Opening a completed
 /// library item restores its archive while other selected images keep running.
 /// </summary>
-public sealed class RecognitionService(ImageLibrary library, BackendClient client, Func<int>? parallelism = null) : IDisposable
+public sealed class RecognitionService(ImageLibrary library, BackendClient client, Func<int>? parallelism = null,
+                                       Func<bool>? releaseImmediately = null) : IDisposable
 {
     private readonly ConcurrentQueue<string> _queue = new();
     private readonly ConcurrentDictionary<string, RecognitionStatus> _status = new(StringComparer.OrdinalIgnoreCase);
@@ -22,7 +23,78 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
     private readonly object _sync = new();
     private readonly HashSet<Task> _opens = [];
     private Task _work = Task.CompletedTask;
+    private Task _release = Task.CompletedTask;
+    private int _batches;
+    private bool _held;
     private bool _worker, _disposed;
+
+    /// <summary>主图、辅助视角或一批图片共用模型；立即释放时等所有批次结束再卸载。</summary>
+    public IAsyncDisposable Batch()
+    {
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _batches++;
+            var scope = new BatchScope(this);
+            _opens.Add(scope.Finished.Task);
+            return scope;
+        }
+    }
+
+    private sealed class BatchScope(RecognitionService owner) : IAsyncDisposable
+    {
+        public readonly TaskCompletionSource Finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _done;
+        public ValueTask DisposeAsync() => Interlocked.Exchange(ref _done, 1) == 1
+            ? ValueTask.CompletedTask : new(owner.EndBatchAsync(this));
+    }
+
+    private async Task EndBatchAsync(BatchScope scope)
+    {
+        try
+        {
+            Task release;
+            lock (_sync)
+            {
+                if (--_batches == 0 && _held)
+                {
+                    _held = false;
+                    if (releaseImmediately?.Invoke() == true) _release = UnloadAsync();
+                }
+                release = _release;
+            }
+            await release;
+        }
+        finally
+        {
+            lock (_sync)
+            {
+                scope.Finished.TrySetResult();
+                _opens.Remove(scope.Finished.Task);
+            }
+        }
+    }
+
+    private async Task UnloadAsync()
+    {
+        try { await client.UnloadModelAsync(); }
+        catch { /* The backend also releases an abandoned hold after its idle timeout. */ }
+    }
+
+    private async Task<SessionInfo> CreateAsync(byte[] bytes, string name)
+    {
+        Task release;
+        bool hold;
+        lock (_sync)
+        {
+            release = _release;
+            hold = _batches > 0;
+            if (hold) _held = true;
+        }
+        // A newly opened batch must not race the preceding batch's unload.
+        await release;
+        return await client.CreateSessionAsync(bytes, name, hold);
+    }
 
     public int Pending => _queue.Count;
     public bool Busy { get { lock (_sync) return _worker; } }
@@ -69,7 +141,7 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
             {
                 // Keep inference alive through disposal so its returned session
                 // can be deleted; cancellation only skips work not yet started.
-                info = await client.CreateSessionAsync(bytes, name);
+                info = await CreateAsync(bytes, name);
                 try { library.WriteCache(sha1, await client.SessionArchiveAsync(info.SessionId)); }
                 catch { /* A failed cache write must not prevent foreground use. */ }
             }
@@ -106,6 +178,34 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
         finally { gate.Release(); }
     }
 
+    private readonly ConcurrentDictionary<string, AuxView> _views = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>辅助视角图上次融合时识别出的视角；还没融合过返回 null。</summary>
+    public AuxView? ViewOf(string auxPath) => _views.GetValueOrDefault(auxPath);
+
+    public Task<(string Path, AuxView View)[]> AttachAuxAsync(string sid, string sha1)
+        => Track(() => AttachAuxCoreAsync(sid, sha1));
+
+    private async Task<(string Path, AuxView View)[]> AttachAuxCoreAsync(string sid, string sha1)
+    {
+        await using var batch = Batch();
+        var aux = library.AuxImages(sha1);
+        var sessions = new List<string>();
+        try
+        {
+            foreach (var path in aux)
+                sessions.Add((await OpenAsync(path)).Info.SessionId);
+            var views = await client.SetViewsAsync(sid, sessions);
+            var result = aux.Zip(views).ToArray();
+            foreach (var (path, view) in result) _views[path] = view;
+            return result;
+        }
+        finally
+        {
+            foreach (var session in sessions) await DeleteSessionAsync(session);
+        }
+    }
+
     public void Enqueue(IEnumerable<string> paths)
     {
         lock (_sync)
@@ -138,6 +238,7 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
     {
         try
         {
+            await using var batch = Batch();
             await client.ConfigureRecognitionAsync(limit);
             await Task.WhenAll(Enumerable.Range(0, limit).Select(_ => WorkSlotAsync()));
         }
@@ -170,25 +271,31 @@ public sealed class RecognitionService(ImageLibrary library, BackendClient clien
             {
                 var bytes = await File.ReadAllBytesAsync(path, _cts.Token);
                 var sha1 = library.RememberHash(path, bytes);
-                var gate = _contentGates.GetOrAdd(sha1, _ => new SemaphoreSlim(1));
-                await gate.WaitAsync(_cts.Token);
-                try
+                // Preserve 0.4's auxiliary-view pre-recognition and cache reuse.
+                foreach (var file in library.AuxImages(sha1).Prepend(path))
                 {
-                    if (!library.HasCache(sha1))
+                    var data = file == path ? bytes : await File.ReadAllBytesAsync(file, _cts.Token);
+                    var hash = file == path ? sha1 : library.RememberHash(file, data);
+                    var gate = _contentGates.GetOrAdd(hash, _ => new SemaphoreSlim(1));
+                    await gate.WaitAsync(_cts.Token);
+                    try
                     {
-                        SessionInfo? session = null;
-                        try
+                        if (!library.HasCache(hash))
                         {
-                            session = await client.CreateSessionAsync(bytes, Path.GetFileNameWithoutExtension(path));
-                            library.WriteCache(sha1, await client.SessionArchiveAsync(session.SessionId));
-                        }
-                        finally
-                        {
-                            if (session is not null) await DeleteSessionAsync(session.SessionId);
+                            SessionInfo? session = null;
+                            try
+                            {
+                                session = await CreateAsync(data, Path.GetFileNameWithoutExtension(file));
+                                library.WriteCache(hash, await client.SessionArchiveAsync(session.SessionId));
+                            }
+                            finally
+                            {
+                                if (session is not null) await DeleteSessionAsync(session.SessionId);
+                            }
                         }
                     }
+                    finally { gate.Release(); }
                 }
-                finally { gate.Release(); }
                 _status[path] = new RecognitionStatus(RecognitionState.Done);
                 ok = true;
             }

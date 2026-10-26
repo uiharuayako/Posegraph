@@ -20,6 +20,8 @@ class Session:
     preview_png: bytes
     humans: list[dict]
     inference_ms: float
+    fused: dict | None = None
+    views: list | None = None
 
 
 class SessionCache(MutableMapping[str, Session]):
@@ -48,8 +50,12 @@ class SessionCache(MutableMapping[str, Session]):
         # image data when the plugin forcibly terminates the backend process.
         archive = NamedTemporaryFile(mode="w+b", suffix=".npz", dir=self._directory.name)
         try:
+            # Private spill envelope; public session archives keep their schema.
+            payload = [{"count": len(session.humans), "views": session.views}, *session.humans]
+            if session.fused is not None:
+                payload.append(session.fused)
             archive.write(session_archive.pack(session.name, session.image_size, session.preview_png,
-                                               session.humans, session.inference_ms))
+                                               payload, session.inference_ms))
             archive.flush()
             archive.seek(0)
         except BaseException:
@@ -61,8 +67,16 @@ class SessionCache(MutableMapping[str, Session]):
     def _load(stream: BinaryIO, sid: str) -> Session:
         stream.seek(0)
         data = session_archive.unpack(stream.read())
+        metadata, *payload = data["humans"]
+        count = metadata["count"]
         return Session(sid, data["name"], data["image_size"], data["preview_png"],
-                       data["humans"], data["inference_ms"])
+                       payload[:count], data["inference_ms"],
+                       payload[count] if len(payload) > count else None, metadata["views"])
+
+    def set_views(self, sid: str, fused: dict | None, views: list | None) -> None:
+        with self._lock:
+            session = self[sid]  # Reacquire after fusion; a concurrent delete stays deleted.
+            session.fused, session.views = fused, views
 
     def _make_room(self) -> None:
         if len(self._memory) < self.max_in_memory:

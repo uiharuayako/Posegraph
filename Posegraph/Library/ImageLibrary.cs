@@ -354,6 +354,151 @@ public sealed class ImageLibrary
         lock (_lock) _fixed!.Remove(sha1);
     }
 
+    // ------------------------------------------------------------------ 辅助视角
+
+    // 同一姿势别的角度的图，挂在主图上（按主图内容哈希），存在 Cache\<哈希>.aux\ 里，不在图库网格里显示。
+    // views.json 记用户手动指定的视角（文件名 → left / right / back），没有的按识别结果自动判断。
+
+    private const string AuxLabelsFile = "views.json";
+
+    public string AuxDir(string sha1) => System.IO.Path.Combine(CacheDir, sha1 + ".aux");
+
+    private Dictionary<string, int>? _auxCount;   // 画网格角标用，不每帧查磁盘
+
+    public int AuxCount(string sha1)
+    {
+        lock (_lock)
+        {
+            if (_auxCount is null)
+            {
+                _auxCount = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                if (Directory.Exists(CacheDir))
+                    foreach (var dir in Directory.EnumerateDirectories(CacheDir, "*.aux"))
+                        _auxCount[System.IO.Path.GetFileNameWithoutExtension(dir)] = Directory.EnumerateFiles(dir).Count(IsImage);
+            }
+            return _auxCount.GetValueOrDefault(sha1);
+        }
+    }
+
+    public string[] AuxImages(string sha1)
+    {
+        var dir = AuxDir(sha1);
+        return Directory.Exists(dir)
+            ? Directory.EnumerateFiles(dir).Where(IsImage).OrderBy(f => f, StringComparer.CurrentCultureIgnoreCase).ToArray()
+            : [];
+    }
+
+    /// <summary>某张主图（哈希）的辅助视角图增删了：主窗口正开着这张图时重新融合。</summary>
+    public event Action<string>? AuxChanged;
+
+    private void RecountAux(string sha1)
+    {
+        var count = AuxImages(sha1).Length;
+        lock (_lock)
+            if (_auxCount is not null) _auxCount[sha1] = count;
+        AuxChanged?.Invoke(sha1);
+    }
+
+    /// <summary>
+    /// 把图片挂为 sha1 那张主图的辅助视角：复制（move 为移动，图库里的图挂上去后就不在网格里了）。
+    /// 与主图或已有辅助图内容相同的跳过。返回挂上的新路径。
+    /// </summary>
+    public List<string> AddAux(string sha1, IEnumerable<string> files, bool move = false)
+    {
+        var dir = AuxDir(sha1);
+        Directory.CreateDirectory(dir);
+        var known = AuxImages(sha1).Select(Hash).Append(sha1).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var added = new List<string>();
+        foreach (var file in files.Where(f => File.Exists(f) && IsImage(f)))
+        {
+            var bytes = File.ReadAllBytes(file);
+            if (!known.Add(Sha1(bytes))) continue;
+            var target = Unique(System.IO.Path.Combine(dir, System.IO.Path.GetFileName(file)));
+            if (move)
+            {
+                File.Move(file, target);
+                Forget(file);
+            }
+            else File.WriteAllBytes(target, bytes);
+            RememberHash(target, bytes);
+            added.Add(target);
+        }
+        RecountAux(sha1);
+        Save();
+        return added;
+    }
+
+    /// <summary>剪切板图片挂为辅助视角；与主图或已有辅助图相同时返回 null。</summary>
+    public string? AddAuxPng(string sha1, byte[] png)
+    {
+        if (sha1.Equals(Sha1(png), StringComparison.OrdinalIgnoreCase) || AuxImages(sha1).Any(f => Hash(f).Equals(Sha1(png), StringComparison.OrdinalIgnoreCase)))
+            return null;
+        Directory.CreateDirectory(AuxDir(sha1));
+        var path = Unique(System.IO.Path.Combine(AuxDir(sha1), $"{Loc.T("剪切板")} {DateTime.Now:yyyyMMdd-HHmmss}.png"));
+        File.WriteAllBytes(path, png);
+        RememberHash(path, png);
+        RecountAux(sha1);
+        Save();
+        return path;
+    }
+
+    /// <summary>去掉一张辅助视角图（进回收站）。</summary>
+    public void RemoveAux(string sha1, string path)
+    {
+        RecycleBin.Send([path]);
+        if (!File.Exists(path)) Forget(path);
+        SetAuxLabel(sha1, path, null);
+        RecountAux(sha1);
+        Save();
+    }
+
+    private Dictionary<string, string> ReadAuxLabels(string sha1)
+    {
+        try
+        {
+            var file = System.IO.Path.Combine(AuxDir(sha1), AuxLabelsFile);
+            return File.Exists(file)
+                ? JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(file), Json) ?? new()
+                : new();
+        }
+        catch
+        {
+            return new();
+        }
+    }
+
+    /// <summary>用户手动指定的视角（left / right / back），没指定返回 null。</summary>
+    public string? AuxLabel(string sha1, string path) => ReadAuxLabels(sha1).GetValueOrDefault(System.IO.Path.GetFileName(path));
+
+    public void SetAuxLabel(string sha1, string path, string? label)
+    {
+        var labels = ReadAuxLabels(sha1);
+        var name = System.IO.Path.GetFileName(path);
+        if (label is null && !labels.Remove(name)) return;
+        if (label is not null) labels[name] = label;
+        if (!Directory.Exists(AuxDir(sha1))) return;
+        File.WriteAllText(System.IO.Path.Combine(AuxDir(sha1), AuxLabelsFile), JsonSerializer.Serialize(labels, Json));
+    }
+
+    /// <summary>
+    /// 文件名约定：「xxx-1.png」「xxx-2.jpg」这样的图，同一文件夹里有「xxx.任意扩展名」时自动挂为它的辅助视角（移出图库网格）。
+    /// 返回挂上的张数。
+    /// </summary>
+    public int AttachNumbered(IEnumerable<string> paths)
+    {
+        var attached = 0;
+        foreach (var path in paths.Where(File.Exists))
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(System.IO.Path.GetFileNameWithoutExtension(path), @"^(.+)-\d{1,2}$");
+            if (!m.Success) continue;
+            var dir = System.IO.Path.GetDirectoryName(path)!;
+            var main = Directory.EnumerateFiles(dir, m.Groups[1].Value + ".*").FirstOrDefault(IsImage);
+            if (main is null) continue;
+            attached += AddAux(Hash(main), [path], move: true).Count;
+        }
+        return attached;
+    }
+
     // ------------------------------------------------------------------ 文件操作
 
     /// <summary>文件名里不能有的字符、首尾空格、点结尾都视为非法。</summary>

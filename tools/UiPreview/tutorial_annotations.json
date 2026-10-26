@@ -1,0 +1,79 @@
+{
+  "tut-empty": [
+    {"box": [22, 47, 136, 68], "zh": "状态：Brio、GPose、后端、显存、内存。绿色正常，悬停看详情", "en": "Status: Brio, GPose, backend, VRAM, RAM. Green is fine; hover for details"},
+    {"at": [39, 90], "zh": "图库：导入、分类、批量识别", "en": "Library: import, organize, batch recognize"},
+    {"at": [108, 90], "zh": "把当前图存入图库（附带修正）", "en": "Save the current image to the library (with corrections)"},
+    {"at": [143, 90], "zh": "辅助视角：挂上同一动作其他角度的图", "en": "Extra views: attach other angles of the same pose"},
+    {"at": [110, 118], "zh": "要摆姿势的角色（默认 GPose 目标）", "en": "Character to pose (GPose target by default)"},
+    {"at": [36, 635], "zh": "应用到角色", "en": "Apply to the character", "dir": "down"},
+    {"at": [69, 635], "zh": "复刻照片镜头", "en": "Match the photo's camera", "dir": "down"},
+    {"at": [391, 60], "zh": "启动 / 停止识别后端", "en": "Start / stop the backend", "dir": "down-right"},
+    {"at": [460, 60], "zh": "设置", "en": "Settings", "dir": "down-right"},
+    {"at": [181, 90], "zh": "角色列表：多个角色各绑一张图", "en": "Character list: one image per character"},
+    {"at": [385, 118], "zh": "种族骨架（按角色外貌自动识别）", "en": "Race skeleton (detected from the character)"},
+    {"box": [24, 137, 232, 157], "zh": "图像 / 3D / 调整 / 提示 / 设置", "en": "Image / 3D / Tuning / Hints / Settings"},
+    {"at": [245, 400], "zh": "把图片拖到这里，或点一下从图库选", "en": "Drop an image here, or click to pick from the library"},
+    {"at": [138, 635], "zh": "导出 .pose / 存到 Brio 姿势库", "en": "Export .pose / save to the Brio pose library", "dir": "down"},
+    {"at": [171, 635], "zh": "勾上：松开滑杆自动应用", "en": "Checked: apply when you release a slider", "dir": "down"}
+  ],
+  "tut-image": [
+    {"at": [262, 452], "zh": "绿线：从照片识别出的骨架", "en": "Green: skeleton recognized from the photo"},
+    {"at": [230, 565], "zh": "橙线：换算到你的种族后的 FF14 骨架", "en": "Orange: the FF14 skeleton for your race"},
+    {"at": [36, 635], "zh": "满意就点这里应用到角色", "en": "Happy with it? Apply to the character", "dir": "down"},
+    {"box": [24, 166, 248, 188], "zh": "两套骨架可以分别显示 / 隐藏", "en": "Toggle each skeleton overlay"},
+    {"at": [385, 118], "zh": "(!) 表示有骨架提示，悬停查看", "en": "(!) means there are skeleton notes; hover to read"},
+    {"box": [22, 652, 190, 670], "zh": "识别用时；同一张图再打开直接读缓存", "en": "Recognition time; reopening the same image uses the cache"}
+  ],
+  "tut-3d": [
+    {"at": [36, 176], "zh": "保存修正：偏移和调整页的数值跟着这张图走", "en": "Save correction: offsets and tuning values stay with this image"},
+    {"at": [210, 266], "zh": "点关节选中，下方出现微调滑杆", "en": "Click a joint to select it and show fine-tuning sliders"},
+    {"at": [256, 262], "zh": "黄 / 红点：角度超出游戏常见范围", "en": "Yellow / red dots: angles outside the usual in-game range"},
+    {"at": [330, 450], "zh": "拖动旋转，滚轮缩放，双击复位", "en": "Drag to rotate, scroll to zoom, double-click to reset"},
+    {"at": [36, 606], "zh": "叠加显示识别骨架做对比", "en": "Overlay the recognized skeleton to compare"}
+  ],
+  "tut-tuning": [
+    {"at": [36, 176], "zh": "保存修正：这张图调好的值存进这张图", "en": "Save correction: keep this image's values"},
+    {"at": [78, 210], "zh": "预设：照片 / 插画（插画的颈、头幅度更小）", "en": "Preset: photo / illustration (smaller neck and head)"},
+    {"at": [153, 210], "zh": "全部恢复默认", "en": "Restore all defaults", "dir": "right"},
+    {"at": [284, 268], "zh": "幅度：1 = 照片原样，<1 收敛，>1 夸张。右键恢复默认", "en": "Amplitude: 1 = as in the photo, <1 calmer, >1 stronger. Right-click to reset"},
+    {"box": [24, 403, 468, 481], "zh": "手部接触、站姿重力校正与贴地、辅助骨联动", "en": "Hand contact, stance (gravity, ground) and helper bones"}
+  ],
+  "tut-hints": [
+    {"box": [22, 164, 192, 182], "box_en": [22, 164, 300, 182], "zh": "骨架提示（这里是离线截图，没有读到游戏角色）", "en": "Skeleton note (offline screenshot, no game character read)"},
+    {"at": [33, 194], "zh": "红色：明显超出游戏常见范围", "en": "Red: well outside the usual in-game range"},
+    {"at": [78, 214], "zh": "点一下按建议调整幅度", "en": "Click to apply the suggested amplitude"},
+    {"at": [33, 241], "zh": "黄色：偏大，可以留意", "en": "Yellow: a bit large, worth a look"}
+  ],
+  "tut-settings": [
+    {"at": [88, 231], "zh": "第一次使用：选择后端一键包解压后的目录", "en": "First time: choose the folder you unzipped the backend package to"},
+    {"box": [22, 305, 170, 365], "zh": "路径有效、后端已是最新", "en": "Path valid, backend up to date"},
+    {"at": [36, 438], "zh": "插件加载时自动启动后端", "en": "Start the backend when the plugin loads"},
+    {"at": [338, 175], "zh": "更新日志", "en": "Changelog"},
+    {"box": [22, 456, 244, 480], "zh": "识别设备：自动会在显存不够时改用 CPU", "en": "Device: Auto falls back to CPU when VRAM is short"},
+    {"at": [120, 497], "zh": "模型释放：常驻更快，立即释放省显存", "en": "Model release: keep loaded is faster, release saves VRAM"},
+    {"at": [391, 60], "zh": "启动后端", "en": "Start the backend"}
+  ],
+  "tut-library": [
+    {"at": [39, 89], "zh": "导入图片（复制进当前文件夹）", "en": "Import images (copied into this folder)", "dir": "down"},
+    {"at": [73, 89], "zh": "导入整个文件夹", "en": "Import a whole folder", "dir": "down"},
+    {"at": [108, 89], "zh": "粘贴剪切板里的图片", "en": "Paste an image from the clipboard", "dir": "down"},
+    {"at": [72, 164], "zh": "添加已有的图片文件夹（不复制）", "en": "Add an existing image folder (not copied)"},
+    {"at": [648, 61], "zh": "搜索文件名，#标签", "en": "Search names, #tags"},
+    {"at": [685, 118], "zh": "绿勾：已识别，打开不用再等", "en": "Green check: already recognized, opens instantly"},
+    {"at": [386, 165], "zh": "双击打开到主窗口；右键：识别、辅助视角、标签、移动、删除…", "en": "Double-click to open in the main window; right-click: recognize, extra views, tags, move, delete…"},
+    {"at": [338, 90], "zh": "缩略图大小", "en": "Thumbnail size"}
+  ],
+  "tut-split": [
+    {"at": [500, 61], "zh": "贴在主窗口右边", "en": "Dock to the right of the main window"},
+    {"at": [515, 110], "zh": "从图库把图拖到格子里绑定", "en": "Drag an image from the library onto the box"},
+    {"at": [567, 154], "zh": "编辑：切到主窗口细调这个角色", "en": "Edit: fine-tune this character in the main window", "dir": "down"},
+    {"at": [607, 154], "zh": "只应用这一个角色", "en": "Apply only this character", "dir": "down-right"},
+    {"at": [550, 387], "zh": "全部应用：每张图用自己保存的修正", "en": "Apply all: each image uses its own saved correction"},
+    {"at": [181, 90], "zh": "主窗口的这个按钮打开角色列表", "en": "This button opens the character list"}
+  ],
+  "tut-aux": [
+    {"box": [22, 22, 368, 60], "box_en": [22, 22, 684, 60], "zh": "最好是约 90° 的侧面；背面、角度相近的帮助不大", "en": "A ~90° side view works best; back views and similar angles help little"},
+    {"at": [60, 112], "zh": "从文件添加（复制，不进图库网格）", "en": "Add from files (copied, kept out of the library grid)"},
+    {"at": [60, 130], "zh": "或粘贴剪切板里的图", "en": "Or paste from the clipboard"}
+  ]
+}

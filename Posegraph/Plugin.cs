@@ -21,6 +21,10 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem _windows = new("Posegraph");
     private readonly MainWindow _main;
     private readonly LibraryWindow _library;
+    private readonly AuxViewsMenu _auxMenu;
+    private readonly SplitWindow _split;
+    private readonly UpdateWindow _update;
+    private bool _changelogChecked;   // 本次加载后第一次打开主窗口时检查一次是否要弹更新日志
     private readonly IDragDropManager _dragDrop;
     private readonly IFramework _framework;
     private readonly IClientState _clientState;
@@ -56,9 +60,17 @@ public sealed class Plugin : IDalamudPlugin
         _main = new MainWindow(_config, pi, clientState, textures, readback, dragDrop, brio,
                                new PoseApplier(framework, clientState, targetManager, brio), _server);
         _windows.AddWindow(_main);
+        _auxMenu = new AuxViewsMenu(_config, _main.Library, _main.Recognition, textures, readback, log);
+        _main.AuxMenu = _auxMenu;
         _library = new LibraryWindow(_config, pi, _main.Library, _main.Recognition, textures, readback, dragDrop, log,
-                                     _main.OpenImage, _main.SaveToBrioAsync, () => _main.BackendOnline);
+                                     _main.OpenImage, _main.SaveToBrioAsync, () => _main.BackendOnline, _auxMenu);
         _windows.AddWindow(_library);
+        _split = new SplitWindow(_config, pi, _main, _library, _main.Library, _auxMenu, textures, dragDrop, log);
+        _windows.AddWindow(_split);
+        _main.ToggleSplit = _split.Toggle;
+        _update = new UpdateWindow(_config, pi, textures);
+        _windows.AddWindow(_update);
+        _main.ShowChangelog = () => _update.IsOpen = true;
         _main.ToggleLibrary = _library.Toggle;
         _main.LibraryChanged = _library.Refresh;
         _dragDrop = dragDrop;
@@ -71,6 +83,7 @@ public sealed class Plugin : IDalamudPlugin
         framework.Update += OnFrameworkUpdate;
         pi.UiBuilder.Draw += DrawDragSource;
         pi.UiBuilder.Draw += _windows.Draw;
+        pi.UiBuilder.Draw += _auxMenu.DrawDialogs;
         pi.UiBuilder.OpenMainUi += ToggleManually;
         pi.UiBuilder.OpenConfigUi += _main.OpenSettings;
 
@@ -127,6 +140,11 @@ public sealed class Plugin : IDalamudPlugin
     /// 自动打开的窗口在退出 GPose 时关闭，手动打开的保持不动。</summary>
     private void OnFrameworkUpdate(IFramework framework)
     {
+        if (!_changelogChecked && _main.IsOpen)
+        {
+            _changelogChecked = true;
+            _update.ShowIfUpdated();
+        }
         var gposing = _clientState.IsGPosing;
         if (gposing != _wasGposing)
         {
@@ -167,11 +185,15 @@ public sealed class Plugin : IDalamudPlugin
         _framework.Update -= OnFrameworkUpdate;
         _commands.RemoveHandler(Command);
         _pi.UiBuilder.Draw -= _windows.Draw;
+        _pi.UiBuilder.Draw -= _auxMenu.DrawDialogs;
         _pi.UiBuilder.Draw -= DrawDragSource;
         _pi.UiBuilder.OpenMainUi -= ToggleManually;
         _pi.UiBuilder.OpenConfigUi -= _main.OpenSettings;
         _windows.RemoveAllWindows();
         _library.Dispose();
+        _split.Dispose();
+        _update.Dispose();
+        _auxMenu.Dispose();
         _main.Dispose();
         _server.Dispose();
         _pi.SavePluginConfig(_config);

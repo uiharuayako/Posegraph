@@ -73,6 +73,27 @@ class SessionCacheTests(unittest.TestCase):
         self.assertFalse(list(Path(self.cache._directory.name).iterdir()))
         self.assertEqual(self.cache.in_memory_count, 0)
 
+    def test_fused_views_survive_spill_and_late_updates_do_not_revive_deleted_sessions(self):
+        original = make_session("main")
+        original.fused = make_session("fused", 9).humans[0]
+        original.views = [{"yaw": 20.0, "view": "right"}]
+        self.cache["main"] = original
+        for sid in ("second", "third"):
+            self.cache[sid] = make_session(sid)
+        restored = self.cache["main"]
+        self.assertEqual(restored.views, original.views)
+        np.testing.assert_array_equal(restored.fused["joint_coords"], original.fused["joint_coords"])
+        # A fusion computation can still hold `restored` after eviction.
+        for sid in ("fourth", "fifth"):
+            self.cache[sid] = make_session(sid)
+        self.cache.set_views("main", None, None)
+        self.assertIsNone(self.cache["main"].fused)
+        self.assertIsNone(self.cache["main"].views)
+        self.cache.discard("main")
+        with self.assertRaises(KeyError):
+            self.cache.set_views("main", original.fused, original.views)
+        self.assertNotIn("main", self.cache)
+
     def test_disk_failure_keeps_existing_session_and_memory_bound(self):
         for sid in ("first", "second"):
             self.cache[sid] = make_session(sid)
@@ -134,7 +155,7 @@ class BatchSessionApiTests(unittest.TestCase):
     def test_more_than_eight_images_remain_selectable_without_reinference(self):
         calls = []
 
-        def estimate(data):
+        def estimate(data, hold=False):
             calls.append(data)
             marker = len(calls)
             human = HumanEstimate(

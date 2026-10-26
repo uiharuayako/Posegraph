@@ -4,6 +4,8 @@
 
 Turn a photo or an illustration into a pose for your FINAL FANTASY XIV character.
 
+**New here? Start with the [step-by-step tutorial](docs/tutorial/README.md)** (with screenshots).
+
 Posegraph is a Dalamud plugin with a local AI backend. Pick an image in game, and the backend recognizes the
 3D body pose with Meta's [SAM 3D Body](https://github.com/facebookresearch/sam-3d-body), retargets it onto the
 FFXIV skeleton of your race, and the plugin applies it to your GPose actor through [Brio](https://github.com/Etheirys/Brio).
@@ -27,6 +29,9 @@ Posegraph plugin (in game, ImGui)  ── HTTP (127.0.0.1) ──►  Posegraph 
 - **Live tuning without re-running the AI**: per-region amplitude (spine, neck, head, clavicle, wrist), hand contact
   compensation, gravity correction, ground snapping, helper-bone strength, and manual per-joint offsets in a 3D stick figure.
   Dragging a slider updates the preview; releasing it applies the pose (Brio's undo history stays clean).
+- **Image library**: import, organize with folders / tags / favorites, batch recognition with a cache, save to the Brio pose library.
+- **Several characters at once** (character list): bind one image to each GPose character and apply them all.
+- **Extra views**: attach other angles of the same pose to fix the front/back depth a single photo can't tell.
 - **Plausibility hints** with one-click fixes, based on ranges sampled from in-game animations.
 - **Hand contact compensation**: hands touching the head / chest / hips stay in contact even when your race's
   proportions differ from the person in the photo; elbows stay pure hinges.
