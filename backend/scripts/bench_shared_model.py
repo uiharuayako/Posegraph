@@ -300,6 +300,8 @@ def benchmark(args, output):
     sampler.thread.start()
     runner, arrays = None, {}
     executor = ThreadPoolExecutor(max_workers=args.workers)
+    concurrency_lock = threading.Lock()
+    active_calls = peak_calls = 0
     start = time.perf_counter()
     try:
         sampler.phase = "load"
@@ -322,11 +324,13 @@ def benchmark(args, output):
             torch.cuda.synchronize()
         report["model_prepare_seconds"] = time.perf_counter() - start
         report["memory_after_load"] = _memory()
+        print(json.dumps({"phase": "loaded", "device": args.device, "workers": args.workers}), flush=True)
         sampler.phase = "warmup"
         started = time.perf_counter()
         for _ in range(args.warmup):
             list(executor.map(estimate, [images[i % len(images)] for i in range(max(len(images), args.workers))]))
         report["warmup_seconds"] = time.perf_counter() - started
+        print(json.dumps({"phase": "warmup_complete", "device": args.device, "workers": args.workers}), flush=True)
         if args.device == "cuda" and args.strategy != "process":
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
@@ -334,8 +338,16 @@ def benchmark(args, output):
         measured_start = time.perf_counter()
 
         def run(repeat, image_index, queued):
+            nonlocal active_calls, peak_calls
             begin = time.perf_counter()
-            result = estimate(images[image_index])
+            with concurrency_lock:
+                active_calls += 1
+                peak_calls = max(peak_calls, active_calls)
+            try:
+                result = estimate(images[image_index])
+            finally:
+                with concurrency_lock:
+                    active_calls -= 1
             return {"repeat_index": repeat, "image_index": image_index,
                     "latency_ms": (time.perf_counter() - begin) * 1000,
                     "queue_wait_ms": (begin - queued) * 1000, "humans": len(result.humans),
@@ -347,11 +359,15 @@ def benchmark(args, output):
         for future in as_completed(futures):
             row, result = future.result()
             results.append((row, result))
+            if len(results) % len(images) == 0 or len(results) == len(futures):
+                print(json.dumps({"phase": "measure", "device": args.device, "workers": args.workers,
+                                  "completed": len(results), "total": len(futures)}), flush=True)
         if args.device == "cuda" and args.strategy != "process":
             torch.cuda.synchronize()
             report["cuda_peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
             report["cuda_peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
         report["measured_wall_seconds"] = time.perf_counter() - measured_start
+        report["peak_concurrent_calls"] = peak_calls
         # Serialize after the measured interval, so disk compression is not throughput.
         workers = {}
         for row, result in results:
@@ -413,7 +429,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--strategy", choices=("serial", "shared", "process"), default="serial")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--workers", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--workers", type=int, choices=range(1, 9), default=1)
     parser.add_argument("--images", type=Path, nargs="+")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
