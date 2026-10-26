@@ -31,8 +31,11 @@ class Settings:
     min_free_vram_mb: int = field(default_factory=lambda: int(_env("MIN_FREE_VRAM_MB", "3000")))
     # 识别完成后多少秒释放模型：0 立即释放，-1 常驻
     release_after: float = field(default_factory=lambda: float(_env("RELEASE_AFTER", "0")))
-    # 多图识别并行数；默认串行。并行槽各自持有完整模型。
+    # 多图识别并行数；默认串行。process 策略的并行槽各自持有完整模型。
     recognition_parallelism: int = field(default_factory=lambda: min(8, max(1, int(_env("RECOGNITION_PARALLELISM", "1")))))
+    # Experimental shared-parameter inference; keep the published process strategy as the default.
+    recognition_strategy: str = field(default_factory=lambda: _env("RECOGNITION_STRATEGY", "process"))
+    shared_cuda_streams: bool = field(default_factory=lambda: _env("SHARED_CUDA_STREAMS", "1") == "1")
 
     # Posegraph 插件的本地 HTTP 地址
     bridge_url: str = field(default_factory=lambda: _env("BRIDGE_URL", "http://127.0.0.1:42429"))

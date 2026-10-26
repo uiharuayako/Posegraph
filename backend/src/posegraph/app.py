@@ -24,6 +24,7 @@ import io
 import threading
 import time
 import uuid
+from typing import Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
@@ -42,6 +43,7 @@ from .retarget.brio_pose import BrioPose
 from .retarget.ffxiv import load_mhr_rest, to_brio_pose_json
 from .session_cache import Session, SessionCache
 from .inference_pool import InferenceFailure, InferencePool, ModelLifecycle
+from .shared_inference import SharedInferencePool
 from .i18n import _lang
 
 app = FastAPI(title="posegraph", version=__version__)
@@ -52,7 +54,10 @@ _model_lifecycle = ModelLifecycle()
 _model_state = {"loading": False, "error": None}
 _release_after = settings.release_after
 _recognition_parallelism = settings.recognition_parallelism
-_parallel_pool: InferencePool | None = None
+_recognition_strategy = settings.recognition_strategy
+if _recognition_strategy not in ("process", "shared"):
+    raise ValueError("POSEGRAPH_RECOGNITION_STRATEGY must be process or shared")
+_parallel_pool: InferencePool | SharedInferencePool | None = None
 _last_used = time.monotonic()
 
 PREVIEW_MAX_SIDE = 1280
@@ -91,11 +96,20 @@ def _worker_config() -> dict:
             if hasattr(_estimator, key)}
 
 
-def _get_parallel_pool() -> InferencePool:
+def _uses_inference_pool() -> bool:
+    return _recognition_parallelism > 1 or _recognition_strategy == "shared"
+
+
+def _get_parallel_pool() -> InferencePool | SharedInferencePool:
     global _parallel_pool
     with _model_lock:
         if _parallel_pool is None:
-            _parallel_pool = InferencePool(_recognition_parallelism, _worker_config())
+            config = _worker_config()
+            if _recognition_strategy == "shared":
+                config["cuda_streams"] = settings.shared_cuda_streams
+                _parallel_pool = SharedInferencePool(_recognition_parallelism, config)
+            else:
+                _parallel_pool = InferencePool(_recognition_parallelism, config)
         return _parallel_pool
 
 
@@ -108,7 +122,7 @@ def _close_parallel_pool() -> None:
 
 def _load_model() -> None:
     with _model_lifecycle.exclusive():
-        if _recognition_parallelism == 1:
+        if not _uses_inference_pool():
             _load_serial_model()
         else:
             _model_state.update(loading=True, error=None)
@@ -151,15 +165,18 @@ def _model_info() -> dict:
             "config": {"device": getattr(_estimator, "device", None), "releaseAfter": _release_after,
                        "mhrOnCpu": getattr(_estimator, "mhr_on_cpu", None),
                        "minFreeVramMb": getattr(_estimator, "min_free_vram_mb", None),
-                       "recognitionParallelism": _recognition_parallelism}}
+                       "recognitionParallelism": _recognition_parallelism,
+                       "recognitionStrategy": _recognition_strategy},
+            "modelCopies": int(_estimator.loaded)}
     pool = _parallel_pool
-    if _recognition_parallelism > 1:
+    if _uses_inference_pool():
         states = pool.states if pool is not None else []
         active = next((state for state in states if state["loaded"]), None)
         info.update(loaded=any(state["loaded"] for state in states),
                     loading=_model_state["loading"] or any(state["loading"] for state in states),
                     error=next((state["error"] for state in states if state["error"]), _model_state["error"]),
-                    workers=states, activeInferences=_model_lifecycle.active)
+                    workers=states, activeInferences=_model_lifecycle.active,
+                    modelCopies=sum(bool(state["loaded"]) for state in states))
         if active:
             info.update(device=active["device"], precision=active["precision"],
                         deviceReason=_reason(active["device_reason"]))
@@ -207,27 +224,31 @@ class ModelConfig(BaseModel):
     mhr_on_cpu: bool | None = None
     min_free_vram_mb: int | None = None
     recognition_parallelism: int | None = Field(default=None, ge=1, le=8, strict=True)
+    recognition_strategy: Literal["process", "shared"] | None = None
 
 
 @app.post("/model/config")
 def model_config(cfg: ModelConfig) -> dict:
     """运行时修改设备与释放策略。设备相关的改动在下次加载时生效（已加载的模型会先卸载）。"""
-    global _release_after, _recognition_parallelism
+    global _release_after, _recognition_parallelism, _recognition_strategy
     if cfg.device is not None and cfg.device not in ("auto", "cuda", "cpu"):
         raise HTTPException(400, tr("device 只能是 auto / cuda / cpu"))
     with _model_lifecycle.exclusive(), _model_lock:
-        reload = False
-        for key in ("device", "mhr_on_cpu", "min_free_vram_mb"):
-            value = getattr(cfg, key)
-            if value is not None and getattr(_estimator, key) != value:
-                setattr(_estimator, key, value)
-                reload = True
-        if cfg.recognition_parallelism is not None and cfg.recognition_parallelism != _recognition_parallelism:
-            _recognition_parallelism = cfg.recognition_parallelism
-            reload = True
+        changes = {key: getattr(cfg, key) for key in ("device", "mhr_on_cpu", "min_free_vram_mb")
+                   if getattr(cfg, key) is not None and getattr(_estimator, key) != getattr(cfg, key)}
+        next_parallelism = cfg.recognition_parallelism if cfg.recognition_parallelism is not None else _recognition_parallelism
+        next_strategy = cfg.recognition_strategy if cfg.recognition_strategy is not None else _recognition_strategy
+        reload = bool(changes) or next_parallelism != _recognition_parallelism or next_strategy != _recognition_strategy
         if reload:
+            # close() may fail after blocking new leases. Preserve both the old
+            # configuration and pool handle so retrying this exact request will
+            # attempt shutdown again, instead of treating it as a no-op update.
             _close_parallel_pool()
             _estimator.unload()
+        for key, value in changes.items():
+            setattr(_estimator, key, value)
+        _recognition_parallelism = next_parallelism
+        _recognition_strategy = next_strategy
         if cfg.release_after is not None:
             _release_after = cfg.release_after
     return {"model": _model_info()}
@@ -335,9 +356,15 @@ def _estimate(data: bytes):
     rgb = _decode(data)
     with _model_lifecycle.inference():
         try:
-            if _recognition_parallelism > 1:
+            if _uses_inference_pool():
                 try:
+                    previous_load_error = _model_state["error"]
                     result = _get_parallel_pool().estimate(rgb, _release_after, _lang.get())
+                    # A successful retry supersedes an earlier preload failure.
+                    # Keep a newer global error and every per-worker/pool error.
+                    with _model_lock:
+                        if _model_state["error"] == previous_load_error:
+                            _model_state["error"] = None
                 except InferenceFailure as error:
                     raise HTTPException(error.status, str(error)) from error
             else:

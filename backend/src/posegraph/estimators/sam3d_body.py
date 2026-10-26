@@ -245,7 +245,10 @@ class Sam3dBodyEstimator(PoseEstimator):
         with _quiet(), self._device_scope():
             outputs = self._estimator.process_one_image(image_rgb, bboxes=bboxes)
         elapsed = (time.perf_counter() - t0) * 1000
+        return self._make_result(outputs, w, h, elapsed)
 
+    def _make_result(self, outputs: list[dict], w: int, h: int, elapsed: float) -> EstimateResult:
+        """Convert one request's outputs; also used by isolated shared-model views."""
         humans = []
         for o in outputs:
             rest_coords, rest_rots, rest_verts = self._rest_pose(o["shape_params"], o["scale_params"])
