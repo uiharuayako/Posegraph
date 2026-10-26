@@ -108,8 +108,10 @@ and add `Posegraph.dll` under *Dev Plugin Locations*.
   where they show up in Brio's library.
 
 Library batches are sequential by default. Choose **1–8** under *Settings → Recognition backend → Multi-image recognition concurrency*; changes apply to the next batch.
-Parallel recognition requires an updated, restarted backend. Each isolated worker loads a complete model, budgeting approximately **3 GB VRAM** (plus **0.75 GB** when MHR runs on GPU) and **4 GB RAM** per worker. CPU inference has no VRAM budget; Auto may fall back to CPU.
-Estimates exclude the game, images/caches and residual CUDA contexts. GPU parallel throughput and peak memory remain unmeasured. Completed library items can be opened while other jobs continue.
+The default strategy remains `process`: concurrency 1 uses the original single-model serial path; higher values load complete models in isolated processes.
+The settings UI displays a **default process budget** of approximately **3 GB VRAM** (plus **0.75 GB** when MHR runs on GPU) and **4 GB RAM** per model. It excludes the game, images/caches and residual CUDA contexts. CPU inference has no VRAM budget; Auto may fall back to CPU.
+Experimental `shared` mode requires explicit activation through the backend environment or API. Requests isolate their state and share one weight copy; additional RAM/VRAM still depends on inputs and concurrency, so the displayed process budget does not apply. The plugin currently has no strategy selector and does not switch strategies automatically.
+CPU/GPU measurements on one machine, numerical comparisons, and activation/rollback commands are in the [shared-model experiment report](docs/shared-model-experiment.md). In-game library interaction, Brio, and GPU contention with the game remain untested. Completed library items can be opened while other jobs continue.
 Stopping a batch skips queued items and lets running jobs save their archives and release temporary sessions. Content-hash caches and restoration after a backend restart are preserved; more than eight intermediate sessions spill to temporary disk until archived and deleted.
 
 Status bar icons, left to right: Brio, GPose, IVCS (shown once an actor is selected in GPose), backend, VRAM, RAM;
@@ -121,6 +123,7 @@ hover for details.
 |---|---|---|
 | Language | Auto | Chinese if the game client is Chinese, otherwise the Dalamud UI language decides; English if neither is Chinese |
 | Device | Auto | GPU when ~3 GB VRAM is free, otherwise CPU. *GPU* forces the GPU, *CPU* never touches VRAM |
+| Multi-image recognition concurrency | 1 | 1–8, effective next batch; the displayed default process budget does not apply to shared mode |
 | Unload model | Right after recognition | Frees VRAM/RAM for the game; the next recognition reloads the model (~5–10 s) |
 | Keep MHR on the CPU | On | Saves ~750 MB VRAM in GPU mode, ~0.5 s slower |
 | Apply when a slider is released | On | Turn off to apply manually |
@@ -173,6 +176,16 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_sam3d.ps1     # venv, CUD
 Weights come from ModelScope by default (no login); `-Source hf` uses the official gated Hugging Face repository.
 Environment variables (prefix `POSEGRAPH_`): `DEVICE` (auto|cuda|cpu), `PRECISION` (auto|bf16|fp16|fp32), `MHR_ON_CPU`,
 `MIN_FREE_VRAM_MB`, `RELEASE_AFTER` (seconds, 0 = right away, -1 = keep), `PRELOAD`, `SAVE_SESSIONS` (save each recognition as an npz under `outputs/ui`), `PORT`, `BRIDGE_URL`, `SAM3D_REPO`, `SAM3D_CKPT`.
+Also available: `RECOGNITION_PARALLELISM` (1–8, default 1), `RECOGNITION_STRATEGY` (default `process`, explicit `shared` opt-in), and `SHARED_CUDA_STREAMS` (default `1`; `0` uses the shared default stream as a control; shared mode only, restart the backend after changing it).
+
+Switch explicitly while the backend is running; concurrency stays under the existing setting. Restarting restores the strategy from the startup environment:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_strategy":"shared"}'
+# Return to the default strategy
+Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_strategy":"process"}'
+```
+
 
 ### Backend package
 

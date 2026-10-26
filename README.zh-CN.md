@@ -89,8 +89,10 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 - 「存到 Brio 姿势库」把带预览图和标签的 `.pose` 存到 `文档\Brio\Poses\Posegraph`，在 Brio 资料库里直接能看到。
 
 图库批量识别默认串行。在「设置 → 识别后端 → 多图识别并行数」可选 **1～8**，从下一批队列生效。
-并行需要更新并重启后端：每个工作进程独立加载完整模型，资源预算约为每进程 **3 GB 显存**（MHR 在 GPU 时加 **0.75 GB**）和 **4 GB 内存**；CPU 模式不计推理显存，自动档可能回退 CPU。
-预算不含游戏、图片/缓存和残留 CUDA 上下文；GPU 并行性能与峰值尚未实测。已完成的图库项可立即打开，其余任务继续识别。
+默认策略仍为 `process`：并行数 1 沿用原单模型串行路径，大于 1 时由独立进程各加载完整模型。
+设置页显示的**默认多进程预算**约为每份模型 **3 GB 显存**（MHR 在 GPU 时加 **0.75 GB**）和 **4 GB 内存**；不含游戏、图片/缓存和残留 CUDA 上下文。CPU 不计推理显存，自动档可能回退 CPU。
+可通过后端环境变量或 API 显式开启实验 `shared` 策略：各请求隔离状态、共享一份权重；额外内存/显存仍随输入与并发变化，不能套用设置页的多进程预算。插件目前没有策略选择器，也不会自动切换策略。
+CPU/GPU 单机实测、数值核对和启用/回退方式见[共享模型实验报告](docs/shared-model-experiment.md)；游戏内图库交互、Brio 及与游戏争用 GPU 的体验尚未验证。已完成的图库项可立即打开，其余任务继续识别。
 停止批量识别只清除排队项；已开始的任务完成缓存并释放临时会话。缓存仍按内容哈希复用，支持后端重启后恢复；并发中间会话超过 8 份时暂存磁盘，归档后删除。
 
 状态栏图标从左到右：Brio、GPose、IVCS（GPose 里选中角色后显示）、后端、显存、内存，鼠标悬停看详情。
@@ -101,6 +103,7 @@ Posegraph 不在 Dalamud 官方仓库里，从自定义仓库安装：
 |---|---|---|
 | 语言 | 自动 | 游戏客户端是中文就用中文，否则看 Dalamud 界面语言，都不是中文则用英文 |
 | 识别设备 | 自动 | 可用显存约 3GB 时用 GPU，否则用 CPU。「GPU」强制用显卡，「CPU」完全不占显存 |
+| 多图识别并行数 | 1 | 1～8，下批生效；显示的默认多进程预算不适用于共享模式 |
 | 模型释放 | 识别后立即释放 | 显存/内存归还给游戏，下次识别重新加载（约 5~10 秒） |
 | GPU 模式下 MHR 放 CPU | 开 | 显存约省 750MB，每张约慢 0.5 秒 |
 | 松开滑杆时自动应用 | 开 | 关掉后需要手动点应用 |
@@ -151,6 +154,16 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_sam3d.ps1     # 虚拟环
 权重默认从魔搭 ModelScope 下载（免登录）；`-Source hf` 走 Hugging Face 官方仓库（需申请访问）。
 环境变量（前缀 `POSEGRAPH_`）：`DEVICE`（auto|cuda|cpu）、`PRECISION`（auto|bf16|fp16|fp32）、`MHR_ON_CPU`、
 `MIN_FREE_VRAM_MB`、`RELEASE_AFTER`（秒，0 立即、-1 常驻）、`PRELOAD`、`SAVE_SESSIONS`（每次识别另存 npz 到 `outputs/ui`）、`PORT`、`BRIDGE_URL`、`SAM3D_REPO`、`SAM3D_CKPT`。
+另有 `RECOGNITION_PARALLELISM`（1～8，默认 1）、`RECOGNITION_STRATEGY`（默认 `process`，显式选 `shared`）、`SHARED_CUDA_STREAMS`（默认 `1`，`0` 为共享默认 stream 对照；仅共享模式使用，修改后重启后端）。
+
+也可在后端运行时显式切换策略；并行数仍由现有设置决定，重启后恢复启动环境中的策略：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_strategy":"shared"}'
+# 回退到默认策略
+Invoke-RestMethod http://127.0.0.1:42430/model/config -Method Post -ContentType 'application/json' -Body '{"recognition_strategy":"process"}'
+```
+
 
 ### 后端一键包
 

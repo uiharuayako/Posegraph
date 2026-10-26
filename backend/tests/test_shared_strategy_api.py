@@ -82,6 +82,25 @@ class SharedStrategyApiTests(unittest.TestCase):
             service._estimate(b"image")
         self.assertEqual(pool.estimates, 1)
 
+    def test_plugin_partial_updates_preserve_explicit_shared_strategy(self):
+        with TestClient(service.app) as client:
+            response = client.post("/model/config", json={"recognition_strategy": "shared"})
+            self.assertEqual(response.status_code, 200)
+            service._load_model()
+            previous = service._parallel_pool
+            # Existing plugin requests do not include recognition_strategy.
+            for payload in ({"recognition_parallelism": 3},
+                            {"device": "cuda", "release_after": 60, "mhr_on_cpu": False}):
+                response = client.post("/model/config", json=payload)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["model"]["config"]["recognitionStrategy"], "shared")
+            self.assertTrue(previous.closed)
+            config = response.json()["model"]["config"]
+            self.assertEqual(config["recognitionParallelism"], 3)
+            self.assertEqual(config["device"], "cuda")
+            self.assertEqual(config["releaseAfter"], 60)
+            self.assertFalse(config["mhrOnCpu"])
+
     def test_shared_capacity_is_not_reported_as_multiple_loaded_models(self):
         service.model_config(service.ModelConfig(recognition_strategy="shared", recognition_parallelism=3))
         self.assertEqual(service._model_info()["modelCopies"], 0)
